@@ -3,9 +3,11 @@
 为 AI 和用户提供二次元图片获取能力，支持个性化标签筛选和内容级别控制。
 
 权限模型：
-- 管理员名单：config.toml 的 r18.allowed_chats，仅通过 WebUI 维护，插件只读；
+- 管理员名单：config.toml 的 r18.group_allowed_chats（群聊）与 r18.user_allowed_chats（私聊），
+  仅通过 WebUI 维护，填裸群号/QQ号，无需前缀，插件只读；
 - AI 名单：LLM 通过 enable_r18/disable_r18 工具维护，持久化在插件数据目录的
-  r18_whitelist.json 中，与 config.toml 完全隔离，生效名单为两者并集。
+  r18_whitelist.json 中（同样群聊/私聊分开存储），与 config.toml 完全隔离，
+  生效名单为两者并集。
 插件自身不写 config.toml（缺失字段由 SDK Runner 自动补齐）。
 """
 
@@ -20,7 +22,7 @@ import random
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import aiohttp
 from PIL import Image, ImageOps
@@ -47,18 +49,25 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
 
 
 class R18Config(PluginConfigBase):
-    """管理员维护的扩展内容白名单（仅通过 WebUI 编辑，AI 无法修改）。"""
+    """管理员维护的扩展内容白名单（仅通过 WebUI 编辑，AI 无法修改）。
+
+    群聊与私聊分开填写，直接填群号 / QQ 号即可，无需手动加前缀。
+    """
 
     __ui_label__ = "扩展内容设置"
     __ui_icon__ = "shield"
     __ui_order__ = 1
-    allowed_chats: List[str] = Field(
+    group_allowed_chats: List[str] = Field(
         default_factory=list,
-        description='管理员维护的扩展权限会话白名单，格式: "group_群号" 或 "user_QQ号"。',
+        description="允许请求扩展内容的群聊白名单（填群号即可，无需加 group_ 前缀）",
+    )
+    user_allowed_chats: List[str] = Field(
+        default_factory=list,
+        description="允许请求扩展内容的私聊用户白名单（填 QQ 号即可，无需加 user_ 前缀）",
     )
 
 
@@ -68,11 +77,16 @@ class ApiConfig(PluginConfigBase):
     __ui_order__ = 2
     base_url: str = Field(default="https://api.lolicon.app/setu/v2", description="Lolicon API 地址")
     default_num: int = Field(default=1, description="默认请求图片数量")
-    default_size: List[str] = Field(default_factory=lambda: ["regular"], description="默认图片规格")
+    default_size: List[Literal["original", "regular", "small", "thumb", "mini"]] = Field(
+        default_factory=lambda: ["regular"], description="默认图片规格（WebUI 下拉多选）"
+    )
     proxy: str = Field(default="", description="图片反代地址，留空则使用 i.pximg.net")
     exclude_ai: bool = Field(default=True, description="是否排除 AI 作品")
     max_num: int = Field(default=5, description="单次最大请求数量")
-    send_mode: str = Field(default="image", description='发送模式: "image"(全发图片) 或 "link"(全发链接) 或 "both"(两者都发) 或 "kz_link"(全年龄发图片,扩展内容发链接)')
+    send_mode: Literal["image", "link", "both", "kz_link"] = Field(
+        default="image",
+        description='发送模式（WebUI 下拉）。image=全发图片; link=全发链接; both=两者都发; kz_link=全年龄发图片,扩展内容发链接',
+    )
 
 
 class LimitsConfig(PluginConfigBase):
@@ -143,7 +157,8 @@ class SetuPlugin(MaiBotPlugin):
         super().__init__()
         self._http_session: Optional[aiohttp.ClientSession] = None
         # AI 名单（运行时白名单），持久化于插件数据目录，独立于 config.toml
-        self._runtime_whitelist: List[str] = []
+        # 结构: (群聊列表, 私聊列表)
+        self._runtime_whitelist: List[List[str]] = [[], []]
 
     async def on_load(self) -> None:
         self._rate_limiter = RateLimiter(
@@ -166,38 +181,50 @@ class SetuPlugin(MaiBotPlugin):
 
     def _log_whitelist(self) -> None:
         self.ctx.logger.info(
-            "[SetuPlugin] 扩展内容白名单: 管理员配置=%s, AI 开启=%s",
-            self.config.r18.allowed_chats,
-            self._runtime_whitelist,
+            "[SetuPlugin] 扩展内容白名单: 管理员群聊=%s 管理员私聊=%s | AI 群聊=%s AI 私聊=%s",
+            self.config.r18.group_allowed_chats,
+            self.config.r18.user_allowed_chats,
+            self._runtime_whitelist[0],
+            self._runtime_whitelist[1],
         )
 
     # ── 运行时白名单（AI 名单，独立于 config.toml） ──────────────
+    # 结构: (群聊列表, 私聊列表)，均存裸 id（不带 group_/user_ 前缀）。
 
     def _get_runtime_whitelist_path(self) -> Path:
         return self.ctx.paths.data_dir / "r18_whitelist.json"
 
     def _load_runtime_whitelist(self) -> None:
         """加载 AI 开启的白名单；文件损坏时记录错误并按空名单处理（默认拒绝更安全）。"""
+        self._runtime_whitelist = [[], []]
         path = self._get_runtime_whitelist_path()
         if not path.exists():
-            self._runtime_whitelist = []
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            chats = data.get("allowed_chats", []) if isinstance(data, dict) else []
-            self._runtime_whitelist = [str(c).strip() for c in chats if str(c).strip()]
+            if not isinstance(data, dict):
+                self._runtime_whitelist = [[], []]
+                return
+            groups = data.get("group_allowed_chats", [])
+            users = data.get("user_allowed_chats", [])
+            self._runtime_whitelist[0] = [str(c).strip() for c in groups if str(c).strip()]
+            self._runtime_whitelist[1] = [str(c).strip() for c in users if str(c).strip()]
         except Exception as e:
             self.ctx.logger.error("[SetuPlugin] 运行时白名单文件读取失败，按空名单处理: %s", e)
-            self._runtime_whitelist = []
+            self._runtime_whitelist = [[], []]
 
     def _save_runtime_whitelist(self) -> None:
         """原子写回 AI 白名单（先写临时文件再替换，避免写一半损坏）。"""
         path = self._get_runtime_whitelist_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_name(path.name + ".tmp")
+        payload = {
+            "group_allowed_chats": self._runtime_whitelist[0],
+            "user_allowed_chats": self._runtime_whitelist[1],
+        }
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump({"allowed_chats": self._runtime_whitelist}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, path)
 
     # ── 内部工具方法 ──────────────────────────────────────
@@ -224,20 +251,56 @@ class SetuPlugin(MaiBotPlugin):
                 return "user_" + uid
         return ""
 
+    def _split_chat_id(self, value: str) -> Tuple[str, str]:
+        """将形如 "group_123" / "user_456" 的标识拆分为 (kind, id)。
+
+        这种带前缀的标识由 _get_chat_id 统一生成；返回 ("", "") 表示无法识别。
+        """
+        text = str(value).strip()
+        if not text:
+            return "", ""
+        if text.startswith("group_"):
+            return "group", text[len("group_"):].strip()
+        if text.startswith("user_"):
+            return "user", text[len("user_"):].strip()
+        return "", ""
+
     def _check_r18_permission(self, chat_id: str) -> bool:
-        return chat_id in self.config.r18.allowed_chats or chat_id in self._runtime_whitelist
+        """判断会话是否有扩展内容权限：按群聊/私聊分别查管理员名单与 AI 名单。"""
+        kind, cid = self._split_chat_id(chat_id)
+        if not kind or not cid:
+            return False
+        config_list = self.config.r18.group_allowed_chats if kind == "group" else self.config.r18.user_allowed_chats
+        idx = 0 if kind == "group" else 1
+        return cid in config_list or cid in self._runtime_whitelist[idx]
+
+    def _in_admin_whitelist(self, chat_id: str) -> bool:
+        """判断会话是否命中管理员在 config.toml 中维护的白名单。"""
+        kind, cid = self._split_chat_id(chat_id)
+        if not kind or not cid:
+            return False
+        config_list = self.config.r18.group_allowed_chats if kind == "group" else self.config.r18.user_allowed_chats
+        return cid in config_list
 
     def _add_to_whitelist(self, chat_id: str) -> bool:
-        if chat_id in self._runtime_whitelist:
+        kind, cid = self._split_chat_id(chat_id)
+        if not kind or not cid:
             return False
-        self._runtime_whitelist.append(chat_id)
+        idx = 0 if kind == "group" else 1
+        if cid in self._runtime_whitelist[idx]:
+            return False
+        self._runtime_whitelist[idx].append(cid)
         self._save_runtime_whitelist()
         return True
 
     def _remove_from_whitelist(self, chat_id: str) -> bool:
-        if chat_id not in self._runtime_whitelist:
+        kind, cid = self._split_chat_id(chat_id)
+        if not kind or not cid:
             return False
-        self._runtime_whitelist.remove(chat_id)
+        idx = 0 if kind == "group" else 1
+        if cid not in self._runtime_whitelist[idx]:
+            return False
+        self._runtime_whitelist[idx].remove(cid)
         self._save_runtime_whitelist()
         return True
 
@@ -358,7 +421,7 @@ class SetuPlugin(MaiBotPlugin):
             is_r18_item = bool(item.get("r18"))
 
             # 链接模式：直接发送图片链接文本
-            if send_mode in ("link", "链接"):
+            if send_mode == "link":
                 link_text = self._build_link_text(title, author, image_url)
                 try:
                     msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
@@ -395,7 +458,7 @@ class SetuPlugin(MaiBotPlugin):
                     self.ctx.logger.error("[SetuPlugin] 图片防风控处理失败: %s, url=%s", e, image_url, exc_info=True)
             if not b64_data:
                 # 图片下载或处理失败时回退到发链接
-                if send_mode in ("both", "两者"):
+                if send_mode == "both":
                     try:
                         msg_id = await self._send_text_via_api(self._build_link_text(title, author, image_url), stream_id, group_id, user_id)
                         sent_count += 1
@@ -419,7 +482,7 @@ class SetuPlugin(MaiBotPlugin):
                 info_lines.append("• " + r18_flag + title + " - " + author + " - 发送失败: " + str(e))
 
             # both 模式下同时发送链接
-            if send_mode in ("both", "两者"):
+            if send_mode == "both":
                 try:
                     link_msg_id = await self._send_text_via_api(self._build_link_text(title, author, image_url), stream_id, group_id, user_id)
                     recall_sec = self.config.limits.recall_after_seconds
@@ -718,7 +781,7 @@ class SetuPlugin(MaiBotPlugin):
             return {"name": "disable_r18", "content": "无法识别当前会话的群号或用户号，无法操作。"}
         if not self._check_r18_permission(chat_id):
             return {"name": "disable_r18", "content": "当前会话没有 R18 权限，无需关闭。"}
-        if chat_id in self.config.r18.allowed_chats:
+        if self._in_admin_whitelist(chat_id):
             return {"name": "disable_r18", "content": "该会话的 R18 权限由管理员在配置中开启，AI 无法关闭，请联系管理员处理。"}
         self._remove_from_whitelist(chat_id)
         self.ctx.logger.info("[SetuPlugin] 扩展内容权限已关闭: chat_id=%s", chat_id)
