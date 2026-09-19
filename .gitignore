@@ -3,3 +3,5 @@ config.toml
 # 编译缓存不入库
 __pycache__/
 *.pyc
+# 会话工具产物，不入库
+.zcode/

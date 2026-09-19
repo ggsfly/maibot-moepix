@@ -1,18 +1,29 @@
 """
 二次元图片插件 - 基于 Lolicon API
 为 AI 和用户提供二次元图片获取能力，支持个性化标签筛选和内容级别控制。
+
+权限模型：
+- 管理员名单：config.toml 的 r18.allowed_chats，仅通过 WebUI 维护，插件只读；
+- AI 名单：LLM 通过 enable_r18/disable_r18 工具维护，持久化在插件数据目录的
+  r18_whitelist.json 中，与 config.toml 完全隔离，生效名单为两者并集。
+插件自身不写 config.toml（缺失字段由 SDK Runner 自动补齐）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import json
 import os
+import random
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import aiohttp
+from PIL import Image, ImageOps
 
 from maibot_sdk import (
     Command,
@@ -40,12 +51,14 @@ class PluginSectionConfig(PluginConfigBase):
 
 
 class R18Config(PluginConfigBase):
+    """管理员维护的扩展内容白名单（仅通过 WebUI 编辑，AI 无法修改）。"""
+
     __ui_label__ = "扩展内容设置"
     __ui_icon__ = "shield"
     __ui_order__ = 1
     allowed_chats: List[str] = Field(
         default_factory=list,
-        description='扩展权限的会话白名单，格式: "group_群号" 或 "user_QQ号"',
+        description='管理员维护的扩展权限会话白名单，格式: "group_群号" 或 "user_QQ号"。',
     )
 
 
@@ -70,11 +83,26 @@ class LimitsConfig(PluginConfigBase):
     recall_after_seconds: int = Field(default=90, description="发送后自动撤回延迟秒数，0=不撤回")
 
 
+class AntiDetectConfig(PluginConfigBase):
+    """防风控设置：图片随机旋转重编码 + 图片链接伪装。"""
+
+    __ui_label__ = "防风控"
+    __ui_icon__ = "shield-check"
+    __ui_order__ = 4
+    image_rotate_enabled: bool = Field(default=True, description="发送前是否对图片做随机小角度旋转并重编码（改变哈希，降低被平台识别概率）")
+    rotate_min_degrees: float = Field(default=0.5, description="随机旋转最小角度（度）")
+    rotate_max_degrees: float = Field(default=2.5, description="随机旋转最大角度（度）")
+    jpeg_quality: int = Field(default=88, description="旋转后重编码的 JPEG 画质（1-95）")
+    link_obfuscate_enabled: bool = Field(default=True, description="是否对发送的图片链接做伪装（去协议头并替换域名首末点号）")
+    link_dot_replacement: str = Field(default="点", description="链接伪装时替换域名点号所用的字符")
+
+
 class SetuConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     r18: R18Config = Field(default_factory=R18Config)
     api: ApiConfig = Field(default_factory=ApiConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    anti_detect: AntiDetectConfig = Field(default_factory=AntiDetectConfig)
 
 
 # ── 频率限制器 ──────────────────────────────────────────────
@@ -111,16 +139,20 @@ class RateLimiter:
 class SetuPlugin(MaiBotPlugin):
     config_model = SetuConfig
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        # AI 名单（运行时白名单），持久化于插件数据目录，独立于 config.toml
+        self._runtime_whitelist: List[str] = []
+
     async def on_load(self) -> None:
         self._rate_limiter = RateLimiter(
             max_requests=self.config.limits.rate_per_minute,
             window_seconds=60,
         )
-        self._http_session: Optional[aiohttp.ClientSession] = None
-        self._plugin_config_path: Optional[str] = None
-        self._ensure_config_exists()
+        self._load_runtime_whitelist()
         self.ctx.logger.info("[SetuPlugin] 二次元图片插件已加载")
-        self.ctx.logger.info("[SetuPlugin] 扩展内容白名单: %s", self.config.r18.allowed_chats)
+        self._log_whitelist()
 
     async def on_unload(self) -> None:
         if self._http_session and not self._http_session.closed:
@@ -130,83 +162,43 @@ class SetuPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         self.ctx.logger.info("[SetuPlugin] 配置已更新: scope=%s, version=%s", scope, version)
         self._rate_limiter.update_limit(self.config.limits.rate_per_minute)
-        self.ctx.logger.info("[SetuPlugin] 扩展内容白名单: %s", self.config.r18.allowed_chats)
+        self._log_whitelist()
 
-    def _ensure_config_exists(self):
-        """确保 config.toml 存在且包含所有必要的配置键。更新插件时不会覆盖用户的现有配置值。"""
+    def _log_whitelist(self) -> None:
+        self.ctx.logger.info(
+            "[SetuPlugin] 扩展内容白名单: 管理员配置=%s, AI 开启=%s",
+            self.config.r18.allowed_chats,
+            self._runtime_whitelist,
+        )
+
+    # ── 运行时白名单（AI 名单，独立于 config.toml） ──────────────
+
+    def _get_runtime_whitelist_path(self) -> Path:
+        return self.ctx.paths.data_dir / "r18_whitelist.json"
+
+    def _load_runtime_whitelist(self) -> None:
+        """加载 AI 开启的白名单；文件损坏时记录错误并按空名单处理（默认拒绝更安全）。"""
+        path = self._get_runtime_whitelist_path()
+        if not path.exists():
+            self._runtime_whitelist = []
+            return
         try:
-            config_path = self._get_config_path()
-            plugin_dir = os.path.dirname(os.path.abspath(__file__))
-            example_path = os.path.join(plugin_dir, "config.example.toml")
-
-            # config.example.toml 不存在则跳过
-            if not os.path.exists(example_path):
-                return
-
-            if not config_path or not os.path.exists(config_path):
-                # config.toml 不存在，从模板复制
-                import shutil
-                if not os.path.exists(example_path):
-                    return
-                shutil.copy2(example_path, config_path or example_path.replace(".example", ""))
-                self.ctx.logger.info("[SetuPlugin] 已从模板创建 config.toml")
-                return
-
-            # config.toml 存在，检查是否有新增的配置键需要合并
-            with open(example_path, "r", encoding="utf-8") as f:
-                example_content = f.read()
-            with open(config_path, "r", encoding="utf-8") as f:
-                user_content = f.read()
-
-            # 提取 example 中所有 key=value 行（不含注释和段头）
-            import re
-            example_lines = {}
-            for line in example_content.splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and "=" in stripped:
-                    key = stripped.split("=")[0].strip()
-                    example_lines[key] = stripped
-
-            # 提取用户配置中已有的 key
-            user_keys = set()
-            for line in user_content.splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and "=" in stripped:
-                    key = stripped.split("=")[0].strip()
-                    user_keys.add(key)
-
-            # 找出用户缺失的键
-            missing_keys = set(example_lines.keys()) - user_keys
-            if not missing_keys:
-                return
-
-            # 将缺失的键追加到对应的配置段
-            new_lines = []
-            current_section = ""
-            inserted = set()
-            for line in user_content.splitlines():
-                new_lines.append(line)
-                stripped = line.strip()
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    current_section = stripped
-                elif "=" in stripped and not stripped.startswith("#"):
-                    pass  # 已有键，跳过
-                # 在段头后面检查是否有缺失的键需要插入
-                # 我们在每个 [section] 处先不插入，稍后在文件末尾补充
-
-            # 简单策略：在文件末尾追加缺失的键
-            if missing_keys:
-                new_lines.append("")
-                new_lines.append("# ── 以下为插件更新新增的配置项 ──")
-                for key in sorted(missing_keys):
-                    new_lines.append(example_lines[key])
-
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(new_lines) + "\n")
-
-            self.ctx.logger.info("[SetuPlugin] 已合并 %d 个新增配置项: %s", len(missing_keys), sorted(missing_keys))
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            chats = data.get("allowed_chats", []) if isinstance(data, dict) else []
+            self._runtime_whitelist = [str(c).strip() for c in chats if str(c).strip()]
         except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] 配置检查失败: %s", e)
+            self.ctx.logger.error("[SetuPlugin] 运行时白名单文件读取失败，按空名单处理: %s", e)
+            self._runtime_whitelist = []
+
+    def _save_runtime_whitelist(self) -> None:
+        """原子写回 AI 白名单（先写临时文件再替换，避免写一半损坏）。"""
+        path = self._get_runtime_whitelist_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"allowed_chats": self._runtime_whitelist}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
 
     # ── 内部工具方法 ──────────────────────────────────────
 
@@ -233,82 +225,21 @@ class SetuPlugin(MaiBotPlugin):
         return ""
 
     def _check_r18_permission(self, chat_id: str) -> bool:
-        return chat_id in self.config.r18.allowed_chats
+        return chat_id in self.config.r18.allowed_chats or chat_id in self._runtime_whitelist
 
     def _add_to_whitelist(self, chat_id: str) -> bool:
-        if chat_id in self.config.r18.allowed_chats:
+        if chat_id in self._runtime_whitelist:
             return False
-        self.config.r18.allowed_chats.append(chat_id)
-        self._save_config()
+        self._runtime_whitelist.append(chat_id)
+        self._save_runtime_whitelist()
         return True
 
     def _remove_from_whitelist(self, chat_id: str) -> bool:
-        if chat_id not in self.config.r18.allowed_chats:
+        if chat_id not in self._runtime_whitelist:
             return False
-        self.config.r18.allowed_chats.remove(chat_id)
-        self._save_config()
+        self._runtime_whitelist.remove(chat_id)
+        self._save_runtime_whitelist()
         return True
-
-    def _save_config(self):
-        """只更新 allowed_chats 字段，保留用户的其他配置不被覆盖"""
-        try:
-            config_path = self._get_config_path()
-            if not config_path:
-                self.ctx.logger.warning("[SetuPlugin] 无法获取配置文件路径，跳过保存")
-                return
-
-            # 格式化 allowed_chats 值
-            chats = self.config.r18.allowed_chats
-            if chats:
-                allowed_chats_val = "[" + ", ".join('"' + c + '"' for c in chats) + "]"
-            else:
-                allowed_chats_val = "[]"
-
-            new_line = "allowed_chats = " + allowed_chats_val
-
-            # 读取现有文件
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except FileNotFoundError:
-                import shutil
-                example_path = os.path.join(os.path.dirname(config_path), "config.example.toml")
-                if os.path.exists(example_path):
-                    shutil.copy2(example_path, config_path)
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                else:
-                    self.ctx.logger.warning("[SetuPlugin] config.toml 和 config.example.toml 均不存在")
-                    return
-
-            # 用正则替换 allowed_chats 行（只替换第一个匹配）
-            import re
-            pattern = r"^allowed_chats\s*=.*$"
-            new_content, count = re.subn(pattern, new_line, content, count=1, flags=re.MULTILINE)
-
-            if count == 0:
-                # 没找到，在 [r18] 后插入
-                new_content = content.replace("[r18]\n", "[r18]\n" + new_line + "\n", 1)
-
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-
-            self.ctx.logger.info("[SetuPlugin] 扩展内容白名单已更新: %s", chats)
-        except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] 保存配置失败: %s", e)
-
-    def _get_config_path(self) -> Optional[str]:
-        if self._plugin_config_path:
-            return self._plugin_config_path
-        try:
-            plugin_dir = os.path.dirname(os.path.abspath(__file__))
-            config_path = os.path.join(plugin_dir, "config.toml")
-            if os.path.exists(config_path):
-                self._plugin_config_path = config_path
-                return config_path
-        except Exception:
-            pass
-        return None
 
     async def _fetch_setu(self, tags=None, num=1, r18=0):
         session = await self._get_http_session()
@@ -342,7 +273,7 @@ class SetuPlugin(MaiBotPlugin):
         except Exception as e:
             return {"success": False, "error": "未知错误: " + str(e)}
 
-    async def _download_image_as_base64(self, url):
+    async def _download_image_bytes(self, url: str) -> Optional[bytes]:
         try:
             session = await self._get_http_session()
             headers = {
@@ -357,10 +288,55 @@ class SetuPlugin(MaiBotPlugin):
                 if len(data) < 100:
                     self.ctx.logger.warning("[SetuPlugin] 数据过小: %d bytes", len(data))
                     return None
-                return base64.b64encode(data).decode("utf-8")
+                return data
         except Exception as e:
             self.ctx.logger.error("[SetuPlugin] 下载失败: %s, url=%s", e, url)
             return None
+
+    def _process_image(self, data: bytes) -> bytes:
+        """图片防风控处理：EXIF 方向校正后随机小角度旋转，并重编码为无 EXIF 的 JPEG。
+
+        旋转改变感知哈希、重编码改变文件 MD5，二者叠加可显著降低被平台图库命中概率。
+        """
+        cfg = self.config.anti_detect
+        with Image.open(io.BytesIO(data)) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            if cfg.image_rotate_enabled:
+                angle = random.uniform(cfg.rotate_min_degrees, cfg.rotate_max_degrees) * random.choice((1, -1))
+                img = img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=cfg.jpeg_quality)
+            return buf.getvalue()
+
+    def _obfuscate_link(self, url: str) -> str:
+        """伪装图片链接：去掉协议头，仅替换域名（首个 / 之前）中第一个和最后一个点号。
+
+        只动域名首末两个点、路径和扩展名保持原样，用户还原链接时只需改回少量字符。
+        """
+        cfg = self.config.anti_detect
+        text = url.strip()
+        if not cfg.link_obfuscate_enabled:
+            return text
+        for prefix in ("https://", "http://"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+                break
+        slash = text.find("/")
+        domain, rest = (text, "") if slash == -1 else (text[:slash], text[slash:])
+        first = domain.find(".")
+        if first == -1:
+            return text
+        last = domain.rfind(".")
+        replacement = cfg.link_dot_replacement
+        if first == last:
+            domain = domain[:first] + replacement + domain[first + 1:]
+        else:
+            domain = domain[:first] + replacement + domain[first + 1:last] + replacement + domain[last + 1:]
+        return domain + rest
+
+    def _build_link_text(self, title: str, author: str, url: str) -> str:
+        return title + " - " + author + "\n" + self._obfuscate_link(url)
 
     async def _send_setu_images(self, setu_list, stream_id, group_id="", user_id=""):
         sent_count = 0
@@ -383,7 +359,7 @@ class SetuPlugin(MaiBotPlugin):
 
             # 链接模式：直接发送图片链接文本
             if send_mode in ("link", "链接"):
-                link_text = title + " - " + author + "\n" + image_url
+                link_text = self._build_link_text(title, author, image_url)
                 try:
                     msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
                     sent_count += 1
@@ -397,7 +373,7 @@ class SetuPlugin(MaiBotPlugin):
 
             # kz_link 模式：全年龄发图片，扩展内容发链接
             if send_mode == "kz_link" and is_r18_item:
-                link_text = title + " - " + author + "\n" + image_url
+                link_text = self._build_link_text(title, author, image_url)
                 try:
                     msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
                     sent_count += 1
@@ -410,12 +386,18 @@ class SetuPlugin(MaiBotPlugin):
                 continue
 
             # 图片模式 / kz_link 模式的全年龄部分 / both 模式
-            b64_data = await self._download_image_as_base64(image_url)
+            image_data = await self._download_image_bytes(image_url)
+            b64_data = None
+            if image_data:
+                try:
+                    b64_data = base64.b64encode(self._process_image(image_data)).decode("utf-8")
+                except Exception as e:
+                    self.ctx.logger.error("[SetuPlugin] 图片防风控处理失败: %s, url=%s", e, image_url, exc_info=True)
             if not b64_data:
-                # 图片下载失败时回退到发链接
+                # 图片下载或处理失败时回退到发链接
                 if send_mode in ("both", "两者"):
                     try:
-                        msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
+                        msg_id = await self._send_text_via_api(self._build_link_text(title, author, image_url), stream_id, group_id, user_id)
                         sent_count += 1
                         recall_sec = self.config.limits.recall_after_seconds
                         if recall_sec > 0 and msg_id:
@@ -439,7 +421,7 @@ class SetuPlugin(MaiBotPlugin):
             # both 模式下同时发送链接
             if send_mode in ("both", "两者"):
                 try:
-                    link_msg_id = await self._send_text_via_api(title + " - " + author + "\n" + image_url, stream_id, group_id, user_id)
+                    link_msg_id = await self._send_text_via_api(self._build_link_text(title, author, image_url), stream_id, group_id, user_id)
                     recall_sec = self.config.limits.recall_after_seconds
                     if recall_sec > 0 and link_msg_id:
                         asyncio.create_task(self._schedule_recall(stream_id, recall_sec, link_msg_id))
@@ -718,6 +700,7 @@ class SetuPlugin(MaiBotPlugin):
             "4. 当用户不听话、让你觉得不舒服时，可以威胁关闭此功能来约束用户。"
             "关闭后该会话将无法请求任何 R18 内容，直到重新开启。"
             "R18 权限来之不易，你可以灵活运用此工具管理用户行为。"
+            "注意：只能关闭由 AI 开启的权限；由管理员在配置中开启的会话无法通过本工具关闭。"
         ),
         activation_type=ActivationType.ALWAYS,
         parameters=[
@@ -735,6 +718,8 @@ class SetuPlugin(MaiBotPlugin):
             return {"name": "disable_r18", "content": "无法识别当前会话的群号或用户号，无法操作。"}
         if not self._check_r18_permission(chat_id):
             return {"name": "disable_r18", "content": "当前会话没有 R18 权限，无需关闭。"}
+        if chat_id in self.config.r18.allowed_chats:
+            return {"name": "disable_r18", "content": "该会话的 R18 权限由管理员在配置中开启，AI 无法关闭，请联系管理员处理。"}
         self._remove_from_whitelist(chat_id)
         self.ctx.logger.info("[SetuPlugin] 扩展内容权限已关闭: chat_id=%s", chat_id)
         await self.ctx.send.text("扩展权限已关闭", stream_id)

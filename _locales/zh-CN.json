@@ -9,12 +9,12 @@
   "tool.get_setu.param.r18": "是否请求 扩展 内容",
 
   "tool.enable_r18.name": "开启扩展权限",
-  "tool.enable_r18.description": "为指定会话开启 扩展 美图权限",
+  "tool.enable_r18.description": "为指定会话开启 扩展 美图权限（写入插件数据文件，不影响管理员配置）",
   "tool.enable_r18.param.chat_id": "会话标识",
   "tool.enable_r18.param.reason": "开启原因",
 
   "tool.disable_r18.name": "关闭扩展权限",
-  "tool.disable_r18.description": "关闭指定会话的 扩展 美图权限",
+  "tool.disable_r18.description": "关闭指定会话的 扩展 美图权限（仅能关闭由 AI 开启的权限，管理员配置的无法关闭）",
   "tool.disable_r18.param.chat_id": "会话标识",
   "tool.disable_r18.param.reason": "关闭原因",
 
