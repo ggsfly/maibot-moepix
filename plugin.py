@@ -103,10 +103,11 @@ class AntiDetectConfig(PluginConfigBase):
     __ui_label__ = "防风控"
     __ui_icon__ = "shield-check"
     __ui_order__ = 4
-    image_rotate_enabled: bool = Field(default=True, description="发送前是否对图片做随机小角度旋转并重编码（改变哈希，降低被平台识别概率）")
+    image_rotate_enabled: bool = Field(default=True, description="发送前是否对图片做随机小角度旋转（改变感知哈希，降低被平台识别概率）")
     rotate_min_degrees: float = Field(default=0.5, description="随机旋转最小角度（度）")
     rotate_max_degrees: float = Field(default=2.5, description="随机旋转最大角度（度）")
-    jpeg_quality: int = Field(default=88, description="旋转后重编码的 JPEG 画质（1-95）")
+    jpeg_recompress_enabled: bool = Field(default=True, description="是否将图片重编码为 JPEG（也会改变文件 MD5；关闭则保留原格式画质，但失去这一步防风控）。在意画质（如 original）时建议关闭")
+    jpeg_quality: int = Field(default=88, description="重编码的 JPEG 画质（1-95）")
     link_obfuscate_enabled: bool = Field(default=True, description="是否对发送的图片链接做伪装（去协议头并替换域名首末点号）")
     link_dot_replacement: str = Field(default="点", description="链接伪装时替换域名点号所用的字符")
 
@@ -357,17 +358,23 @@ class SetuPlugin(MaiBotPlugin):
             return None
 
     def _process_image(self, data: bytes) -> bytes:
-        """图片防风控处理：EXIF 方向校正后随机小角度旋转，并重编码为无 EXIF 的 JPEG。
+        """图片防风控处理。
 
-        旋转改变感知哈希、重编码改变文件 MD5，二者叠加可显著降低被平台图库命中概率。
+        - 旋转（可选）：EXIF 方向校正后随机小角度旋转，改变感知哈希；
+        - 重编码（可选）：旋转后再重编码为无 EXIF 的 JPEG，改变文件 MD5。
+        两个开关独立，均关闭时返回原格式字节以最大限度保留画质（如 original 原图）。
         """
         cfg = self.config.anti_detect
         with Image.open(io.BytesIO(data)) as img:
             img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB")
             if cfg.image_rotate_enabled:
                 angle = random.uniform(cfg.rotate_min_degrees, cfg.rotate_max_degrees) * random.choice((1, -1))
                 img = img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False)
+            if not cfg.jpeg_recompress_enabled:
+                buf = io.BytesIO()
+                img.save(buf, format=img.format or "PNG")
+                return buf.getvalue()
+            img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=cfg.jpeg_quality)
             return buf.getvalue()
