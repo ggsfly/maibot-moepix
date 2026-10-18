@@ -81,6 +81,10 @@ class ApiConfig(PluginConfigBase):
         default_factory=lambda: ["regular"], description="默认图片规格（WebUI 下拉多选）"
     )
     proxy: str = Field(default="", description="图片反代地址，留空则使用 i.pximg.net")
+    network_proxy: str = Field(
+        default="",
+        description="网络连接代理，如 http://127.0.0.1:7890；留空则直连。填写后 API 请求与图片下载都会经过该代理，并自动改用 Pixiv 官方图床",
+    )
     exclude_ai: bool = Field(default=True, description="是否排除 AI 作品")
     max_num: int = Field(default=5, description="单次最大请求数量")
     send_mode: Literal["image", "link", "both", "kz_link"] = Field(
@@ -313,7 +317,13 @@ class SetuPlugin(MaiBotPlugin):
             "size": self.config.api.default_size,
             "excludeAI": self.config.api.exclude_ai,
         }
-        if self.config.api.proxy.strip():
+        # 填写了网络连接代理，说明本机可通过代理由访问 Pixiv：
+        # 让 Lolicon 直接返回官方图床 i.pximg.net 地址（比公共反代快几十倍），
+        # 下载时同样经该代理。未填代理则沿用原有的反代配置。
+        network_proxy = self.config.api.network_proxy.strip()
+        if network_proxy:
+            body["proxy"] = False
+        elif self.config.api.proxy.strip():
             body["proxy"] = self.config.api.proxy
         if tags:
             body["tag"] = tags
@@ -322,6 +332,7 @@ class SetuPlugin(MaiBotPlugin):
                 self.config.api.base_url,
                 json=body,
                 headers={"Content-Type": "application/json"},
+                proxy=network_proxy or None,
             ) as resp:
                 if resp.status != 200:
                     return {"success": False, "error": "API 请求失败，状态码: " + str(resp.status)}
@@ -344,7 +355,12 @@ class SetuPlugin(MaiBotPlugin):
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Referer": "https://www.pixiv.net/",
             }
-            async with session.get(url, headers=headers, ssl=False) as resp:
+            async with session.get(
+                url,
+                headers=headers,
+                ssl=False,
+                proxy=self.config.api.network_proxy.strip() or None,
+            ) as resp:
                 if resp.status != 200:
                     self.ctx.logger.warning("[SetuPlugin] 下载 HTTP %d: %s", resp.status, url)
                     return None

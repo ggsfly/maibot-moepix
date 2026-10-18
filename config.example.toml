@@ -33,14 +33,18 @@ default_num = 1
 # 注意：部分旧作品可能仅支持 "original" 规格。
 default_size = ["regular"]
 
-# 图片反代地址。
-# 留空（""）则使用 Pixiv 原始地址 i.pximg.net（需要服务器能直接访问 Pixiv）。
+# 图片反代域名。仅在未填写下方 network_proxy 时生效。
+# 留空则不向 Lolicon 指定反代，使用其默认的 i.pixiv.re（公共反代，速度较慢）。
 # 常见反代选项：
 #   - "i.pixiv.re"：Cloudflare 反代（可能间歇性不可用）
-#   - "i.yuki.sh"：自定义反代
 #   - 其他可用的 Pixiv 反代域名
-# 如果服务器已配置代理/VPN，建议留空使用直连。
 proxy = ""
+
+# 网络连接代理。填入本机代理地址后，API 请求与图片下载都会经过它，
+# 并自动改用 Pixiv 官方图床 i.pximg.net（国内实测可达 1 MB/s 以上）。
+# 常见写法："http://127.0.0.1:7890"（Clash / v2ray 默认端口）。
+# 留空表示不使用代理，此时按上面的反代配置下载。
+network_proxy = ""
 
 # 是否排除 AI 生成的作品。建议保持 true，避免潜在的版权争议。
 exclude_ai = true
