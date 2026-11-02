@@ -19,8 +19,10 @@ import io
 import json
 import os
 import random
+import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -39,6 +41,207 @@ from maibot_sdk.types import (
     ToolParameterInfo,
     ToolParamType,
 )
+
+
+# ── 长宽比筛选 ──────────────────────────────────────────────
+
+ASPECT_RATIO_PATTERN = re.compile(
+    r"^(gt|gte|lt|lte|eq)(\d+(?:\.\d+)?)(?:(gt|gte|lt|lte|eq)(\d+(?:\.\d+)?))?$"
+)
+"""长宽比表达式：单个条件（如 gt1.5）或两个条件连写（如 gt1.5lt2.0）。
+
+第二组条件用原子分组：操作符和数值必须成对出现，`gt1.5lt` 这种残缺写法不合法。
+"""
+
+ASPECT_RATIO_MIN = 0.1
+ASPECT_RATIO_MAX = 10.0
+"""长宽比的合理范围，超出视为用户写错了。"""
+
+ASPECT_RATIO_ALIASES: Dict[str, str] = {
+    "horizontal": "gt1",
+    "横图": "gt1",
+    "vertical": "lt1",
+    "竖图": "lt1",
+    "square": "eq1",
+    "方图": "eq1",
+}
+"""长宽比快捷词到表达式的映射。"""
+
+MAX_TAG_GROUPS = 3
+"""单次请求最多携带的标签组数（组间 AND）。"""
+
+MAX_UID_COUNT = 20
+"""单次请求最多携带的作者 UID 数（API 限制）。"""
+
+COMPONENT_TIMEOUT_MS = 120000
+"""组件 RPC 超时声明（毫秒）。
+
+宿主默认 60 秒（component_registry 从组件 metadata 读取 timeout_ms）。
+/tu 命令路径会 await 整个下载+发送流程，多图 + 慢域名时可能超过 60 秒被宿主砍掉，
+声明 120 秒给足时间；单张图片下载仍受会话超时约束，不会无限挂起。
+"""
+
+HELP_TEXT = """🎨 二次元图片插件使用帮助
+
+📌 基础命令
+  /tu                获取 1 张随机图片
+  /tu 3              获取 3 张图片
+  /tu help           显示这份帮助
+
+🏷️ 标签搜索（# 开头，Pixiv 标签精确匹配）
+  /tu #萝莉          单标签
+  /tu #白丝,黑丝     组内 OR（白丝或黑丝）
+  /tu #萝莉 #白丝    组间 AND（萝莉且白丝，最多 3 组）
+  /tu 白丝           裸词 = 标签（旧写法，仍然可用）
+
+🔍 关键词搜索（kw: 前缀，匹配标题/作者/标签）
+  /tu kw:原神        模糊搜索"原神"
+
+📐 长宽比筛选
+  /tu 横图 / 竖图 / 方图    快捷词
+  /tu gt1.5                自定义长宽比表达式
+
+🤖 其他选项
+  /tu r18            R18 内容（需会话已开启权限）
+  /tu noai           排除 AI 作品
+  /tu uid:12345      指定画师
+
+💡 组合示例
+  /tu 3 #萝莉,少女 横图
+  /tu #白丝 #JK noai
+  /tu kw:原神 5 竖图
+"""
+
+
+AI_TYPE_LABELS: Dict[int, str] = {0: "", 1: "✋ 非AI作品", 2: "🤖 AI作品"}
+"""Lolicon API 的 aiType 字段含义（转发节点说明文本用）。"""
+
+HELP_TRIGGERS = frozenset({"help", "帮助", "?", "？"})
+"""触发帮助的输入。"""
+
+
+@dataclass
+class TuParsedArgs:
+    """/tu 命令参数解析结果。"""
+
+    num: int = 1
+    request_r18: bool = False
+    exclude_ai: Optional[bool] = None
+    """noai 显式覆盖；None 表示未指定，回落配置值。"""
+    keyword: str = ""
+    uid: int = 0
+    aspect_ratio: str = ""
+    tags: List[str] = field(default_factory=list)
+    """合并后的标签数组：#组 组内 OR 用 | 连接，裸词各成一组；组间 AND。"""
+    warnings: List[str] = field(default_factory=list)
+    """解析中可告知用户的问题（如表达式无效、标签组超限）。"""
+
+
+def parse_tu_args(args_text: str, *, max_num: int) -> TuParsedArgs:
+    """解析 /tu 后面的参数文本。
+
+    分支优先级：纯数字→数量 → r18/nsfw/adult → noai/排除ai → 长宽比快捷词 →
+    #标签组 → kw: 关键词 → uid: 画师 → 合法长宽比表达式 → 裸词=标签（旧写法）。
+    形似长宽比表达式但不合法的输入（如 gt99）提示后忽略，不当标签。
+    """
+    parsed = TuParsedArgs(num=1)
+    text = (args_text or "").strip()
+    if not text:
+        return parsed
+
+    tag_groups: List[List[str]] = []
+    bare_tags: List[str] = []
+    keyword_parts: List[str] = []
+
+    for raw_arg in text.split():
+        arg = raw_arg.strip()
+        if not arg:
+            continue
+        arg_lower = arg.lower()
+
+        # 数量
+        if arg_lower.isdigit():
+            parsed.num = max(1, min(int(arg_lower), max_num))
+            continue
+
+        # R18（保留旧的 nsfw/adult 别名）
+        if arg_lower in ("r18", "nsfw", "adult"):
+            parsed.request_r18 = True
+            continue
+
+        # 排除 AI
+        if arg_lower in ("noai", "no_ai", "排除ai"):
+            parsed.exclude_ai = True
+            continue
+
+        # 长宽比快捷词
+        if arg_lower in ASPECT_RATIO_ALIASES:
+            parsed.aspect_ratio = ASPECT_RATIO_ALIASES[arg_lower]
+            continue
+
+        # 新格式标签 #a 或 #a,b,c（组内 OR）
+        if arg.startswith("#"):
+            group = [t.strip() for t in arg[1:].split(",") if t.strip()]
+            if group:
+                if len(tag_groups) >= MAX_TAG_GROUPS:
+                    parsed.warnings.append("标签组最多 " + str(MAX_TAG_GROUPS) + " 组，已忽略: " + arg)
+                else:
+                    tag_groups.append(group)
+            continue
+
+        # 关键词 kw:xxx
+        if arg_lower.startswith("kw:"):
+            value = arg.split(":", 1)[1].strip()
+            if value:
+                keyword_parts.append(value)
+            continue
+
+        # 画师 uid:123
+        if arg_lower.startswith("uid:"):
+            try:
+                parsed.uid = int(arg.split(":", 1)[1])
+            except ValueError:
+                parsed.warnings.append("无效的 UID: " + arg)
+            continue
+
+        # 合法的长宽比表达式
+        if validate_aspect_ratio(arg_lower):
+            parsed.aspect_ratio = arg_lower
+            continue
+
+        # 形似长宽比表达式但不合法（如 gt99）→ 提示后忽略，不当标签
+        if ASPECT_RATIO_PATTERN.match(arg_lower):
+            parsed.warnings.append("长宽比表达式无效: " + arg + "，已忽略")
+            continue
+
+        # 裸词 = 标签（旧写法，保持兼容）
+        bare_tags.append(arg)
+
+    merged: List[str] = ["|".join(group) for group in tag_groups]
+    merged.extend(bare_tags)
+    parsed.tags = merged[:MAX_TAG_GROUPS]
+    parsed.keyword = " ".join(keyword_parts)
+    return parsed
+
+
+def validate_aspect_ratio(ratio_str: str) -> bool:
+    """校验长宽比表达式是否合法（如 gt1.5 或 gt1.5lt2.0）。"""
+    if not ratio_str:
+        return False
+    match = ASPECT_RATIO_PATTERN.match(ratio_str)
+    if not match:
+        return False
+    try:
+        first = float(match.group(2))
+        if not (ASPECT_RATIO_MIN <= first <= ASPECT_RATIO_MAX):
+            return False
+        if match.group(3) and match.group(4):
+            second = float(match.group(4))
+            if not (ASPECT_RATIO_MIN <= second <= ASPECT_RATIO_MAX):
+                return False
+        return True
+    except (ValueError, IndexError):
+        return False
 
 
 # ── 配置模型 ──────────────────────────────────────────────
@@ -91,13 +294,27 @@ class ApiConfig(PluginConfigBase):
         default="image",
         description='发送模式（WebUI 下拉）。image=全发图片; link=全发链接; both=两者都发; kz_link=全年龄发图片,扩展内容发链接',
     )
+    use_forward: bool = Field(
+        default=False,
+        description="多图时用合并转发（聊天记录）发送，不刷屏。开启后该批图片走转发通道，自动撤回对转发消息不生效",
+    )
+    max_concurrent_downloads: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="同时下载几张图（1-5）。反代较慢时调小可减少超时",
+    )
 
 
 class LimitsConfig(PluginConfigBase):
     __ui_label__ = "频率限制"
     __ui_icon__ = "clock"
     __ui_order__ = 3
-    rate_per_minute: int = Field(default=3, description="同一用户每分钟最多请求次数")
+    rate_per_minute: int = Field(default=3, description="每分钟最多请求次数")
+    rate_scope: Literal["chat", "user"] = Field(
+        default="chat",
+        description="限频维度（WebUI 下拉）：chat=同一会话共享次数; user=同一用户各自计算",
+    )
     recall_after_seconds: int = Field(default=90, description="发送后自动撤回延迟秒数，0=不撤回")
 
 
@@ -151,6 +368,10 @@ class RateLimiter:
     def update_limit(self, max_requests: int):
         self.max_requests = max_requests
 
+    def clear(self):
+        """清空全部限频记录（配置热更新时调用，避免旧维度 key 残留）。"""
+        self._records.clear()
+
 
 # ── 插件主类 ──────────────────────────────────────────────
 
@@ -164,6 +385,11 @@ class SetuPlugin(MaiBotPlugin):
         # AI 名单（运行时白名单），持久化于插件数据目录，独立于 config.toml
         # 结构: (群聊列表, 私聊列表)
         self._runtime_whitelist: List[List[str]] = [[], []]
+        # 后台任务引用集合：create_task 不持引用可能被 GC 回收，这里统一持有并自动清理
+        self._bg_tasks: set = set()
+        # bot 身份缓存（合并转发节点发送者用），on_load 时从宿主配置读取
+        self._bot_account: str = ""
+        self._bot_nickname: str = ""
 
     async def on_load(self) -> None:
         self._rate_limiter = RateLimiter(
@@ -171,6 +397,7 @@ class SetuPlugin(MaiBotPlugin):
             window_seconds=60,
         )
         self._load_runtime_whitelist()
+        await self._refresh_bot_identity()
         self.ctx.logger.info("[SetuPlugin] 二次元图片插件已加载")
         self._log_whitelist()
 
@@ -182,7 +409,61 @@ class SetuPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         self.ctx.logger.info("[SetuPlugin] 配置已更新: scope=%s, version=%s", scope, version)
         self._rate_limiter.update_limit(self.config.limits.rate_per_minute)
+        self._rate_limiter.clear()
         self._log_whitelist()
+
+    def _spawn_task(self, coro) -> asyncio.Task:
+        """创建后台任务并持引用，完成后自动移除（防止任务被 GC 静默回收）。"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _resolve_rate_key(self, stream_id: str, kwargs: dict) -> str:
+        """按配置的限频维度生成限频 key。
+
+        chat 维度用会话 id；user 维度用发送者 id（加 user: 前缀避免与会话 id 撞名）。
+        取不到用户 id 时回退会话 id。
+        """
+        if self.config.limits.rate_scope == "user":
+            user_id = self._resolve_user_id(kwargs)
+            if user_id:
+                return "user:" + user_id
+        return stream_id or "global"
+
+    @staticmethod
+    def _resolve_user_id(kwargs: dict) -> str:
+        """从调用上下文提取发送者用户 id；取不到返回空串。"""
+        value = kwargs.get("user_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, int) and value:
+            return str(value)
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            message_info = message.get("message_info")
+            if isinstance(message_info, dict):
+                user_info = message_info.get("user_info")
+                if isinstance(user_info, dict):
+                    uid = user_info.get("user_id")
+                    if isinstance(uid, str) and uid.strip():
+                        return uid.strip()
+        return ""
+
+    async def _read_bot_config(self, key: str, default: str) -> str:
+        """读取宿主 bot 配置的一个字段，失败时返回默认值。"""
+        try:
+            value = await self.ctx.config.get(key, default)
+        except Exception as e:
+            self.ctx.logger.warning("[SetuPlugin] 读取宿主配置 %s 失败: %s", key, e)
+            return default
+        text = str(value or "").strip()
+        return text or default
+
+    async def _refresh_bot_identity(self) -> None:
+        """缓存 bot 账号与昵称，供合并转发节点作为发送者显示。"""
+        self._bot_account = await self._read_bot_config("bot.qq_account", "")
+        self._bot_nickname = await self._read_bot_config("bot.nickname", "bot")
 
     def _log_whitelist(self) -> None:
         self.ctx.logger.info(
@@ -309,13 +590,24 @@ class SetuPlugin(MaiBotPlugin):
         self._save_runtime_whitelist()
         return True
 
-    async def _fetch_setu(self, tags=None, num=1, r18=0):
+    async def _fetch_setu(self, tags=None, num=1, r18=0, keyword=None, uid=None, aspect_ratio=None, exclude_ai=None):
+        """请求 Lolicon API。
+
+        Args:
+            tags: Pixiv 标签列表（字符串数组；组内 OR 用 | 连接，组间 AND）。
+            num: 请求张数，会被钳到 1..max_num。
+            r18: 0 全年龄 / 1 R18。
+            keyword: 关键词，API 侧匹配标题、作者、标签。
+            uid: 画师 UID 列表，最多 20 个。
+            aspect_ratio: 长宽比表达式（如 gt1.5），调用方需先校验。
+            exclude_ai: 是否排除 AI 作品；None 时回落配置值（支撑命令的 noai 覆盖）。
+        """
         session = await self._get_http_session()
         body = {
             "r18": r18,
-            "num": min(num, self.config.api.max_num),
+            "num": max(1, min(num, self.config.api.max_num)),
             "size": self.config.api.default_size,
-            "excludeAI": self.config.api.exclude_ai,
+            "excludeAI": self.config.api.exclude_ai if exclude_ai is None else bool(exclude_ai),
         }
         # 填写了网络连接代理，说明本机可通过代理由访问 Pixiv：
         # 让 Lolicon 直接返回官方图床 i.pximg.net 地址（比公共反代快几十倍），
@@ -327,6 +619,14 @@ class SetuPlugin(MaiBotPlugin):
             body["proxy"] = self.config.api.proxy
         if tags:
             body["tag"] = tags
+        if keyword and str(keyword).strip():
+            body["keyword"] = str(keyword).strip()
+        if uid:
+            uid_list = [int(u) for u in uid if str(u).strip().lstrip("-").isdigit()][:MAX_UID_COUNT]
+            if uid_list:
+                body["uid"] = uid_list
+        if aspect_ratio and str(aspect_ratio).strip():
+            body["aspectRatio"] = str(aspect_ratio).strip()
         try:
             async with session.post(
                 self.config.api.base_url,
@@ -425,71 +725,75 @@ class SetuPlugin(MaiBotPlugin):
         return title + " - " + author + "\n" + self._obfuscate_link(url)
 
     async def _send_setu_images(self, setu_list, stream_id, group_id="", user_id=""):
+        """发送图片列表。两阶段结构：先分类并并发预取，再按发送模式发送。
+
+        use_forward 开启时各模式的行为：
+        - image：全部图片进合并转发节点；
+        - both：图片进转发，链接照旧逐条发（转发成功后发）；
+        - kz_link：全年龄图片进转发，R18 链接照旧逐条发；
+        - link：纯链接，use_forward 无效。
+        转发消息无法通过 delete_msg 撤回，use_forward 生效时自动跳过撤回。
+        """
         sent_count = 0
         info_lines = []
         send_mode = self.config.api.send_mode.lower().strip()
+        use_forward = self.config.api.use_forward and send_mode != "link"
 
+        # ── 阶段一：按发送模式把条目分成图片组与链接组 ──
+        image_entries: List[Tuple[dict, str]] = []   # (条目, 图片地址)
+        link_entries: List[Tuple[dict, str]] = []    # (条目, 图片地址)
         for item in setu_list:
             urls = item.get("urls", {})
             image_url = urls.get("regular") or urls.get("original") or urls.get("small") or urls.get("thumb")
             title = item.get("title", "未知")
             author = item.get("author", "未知")
-            pid = item.get("pid", "")
             r18_flag = "🔞" if item.get("r18") else ""
 
             if not image_url:
                 info_lines.append("• " + r18_flag + title + " - " + author + " - 获取图片地址失败")
                 continue
 
-            is_r18_item = bool(item.get("r18"))
+            if send_mode == "link" or (send_mode == "kz_link" and item.get("r18")):
+                link_entries.append((item, image_url))
+            else:
+                image_entries.append((item, image_url))
 
-            # 链接模式：直接发送图片链接文本
-            if send_mode == "link":
-                link_text = self._build_link_text(title, author, image_url)
-                try:
-                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
-                    sent_count += 1
-                    recall_sec = self.config.limits.recall_after_seconds
-                    if recall_sec > 0 and msg_id:
-                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
-                        self.ctx.logger.info("[SetuPlugin] 链接已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
-                except Exception as e:
-                    info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + str(e))
-                continue
+        # ── 阶段二：并发预取图片原始字节（保序；单张失败为 None，不影响其他张） ──
+        image_bytes_list = await self._download_all_bytes([u for _, u in image_entries])
 
-            # kz_link 模式：全年龄发图片，扩展内容发链接
-            if send_mode == "kz_link" and is_r18_item:
-                link_text = self._build_link_text(title, author, image_url)
-                try:
-                    msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
-                    sent_count += 1
-                    recall_sec = self.config.limits.recall_after_seconds
-                    if recall_sec > 0 and msg_id:
-                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
-                        self.ctx.logger.info("[SetuPlugin] 链接已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
-                except Exception as e:
-                    info_lines.append("• " + r18_flag + title + " - 发送链接失败: " + str(e))
-                continue
+        # ── 阶段三：合并转发（use_forward 开启且有图片条目时） ──
+        forward_used = False
+        if use_forward and image_entries:
+            forward_used = await self._send_as_forward(image_entries, image_bytes_list, stream_id)
+            if forward_used:
+                sent_count += len(image_entries)
+                if self.config.limits.recall_after_seconds > 0:
+                    self.ctx.logger.info("[SetuPlugin] 转发消息不支持撤回，本次跳过自动撤回")
+            else:
+                self.ctx.logger.warning("[SetuPlugin] 合并转发发送失败，回退逐条发送")
 
-            # 图片模式 / kz_link 模式的全年龄部分 / both 模式
-            image_data = await self._download_image_bytes(image_url)
-            b64_data = None
-            if image_data:
-                try:
-                    b64_data = base64.b64encode(self._process_image(image_data)).decode("utf-8")
-                except Exception as e:
-                    self.ctx.logger.error("[SetuPlugin] 图片防风控处理失败: %s, url=%s", e, image_url, exc_info=True)
-            if not b64_data:
-                # 图片下载或处理失败时回退到发链接
+        # ── 阶段四：图片组逐条发送（未走转发时） ──
+        for entry, raw in zip(image_entries, image_bytes_list):
+            item, image_url = entry
+
+            if forward_used:
+                # 图片已经通过转发发出；both 模式的链接仍需逐条发
                 if send_mode == "both":
-                    try:
-                        msg_id = await self._send_text_via_api(self._build_link_text(title, author, image_url), stream_id, group_id, user_id)
+                    if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
                         sent_count += 1
-                        recall_sec = self.config.limits.recall_after_seconds
-                        if recall_sec > 0 and msg_id:
-                            asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
-                    except Exception as e:
-                        info_lines.append("• " + r18_flag + title + " - 发送失败: " + str(e))
+                continue
+
+            title = item.get("title", "未知")
+            author = item.get("author", "未知")
+            r18_flag = "🔞" if item.get("r18") else ""
+
+            # 防风控处理（PIL 同步操作）放在发送侧逐张执行，不进并发协程，避免阻塞事件循环
+            b64_data = self._to_base64(raw, image_url)
+            if not b64_data:
+                # 图片下载或处理失败时回退到发链接（both 模式）或报错
+                if send_mode == "both":
+                    if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
+                        sent_count += 1
                 else:
                     info_lines.append("• " + r18_flag + title + " - " + author + " - 图片下载失败")
                 continue
@@ -497,24 +801,121 @@ class SetuPlugin(MaiBotPlugin):
             try:
                 msg_id = await self._send_image_via_api(b64_data, stream_id, group_id, user_id)
                 sent_count += 1
-                recall_sec = self.config.limits.recall_after_seconds
-                if recall_sec > 0 and msg_id:
-                    asyncio.create_task(self._schedule_recall(stream_id, recall_sec, msg_id))
-                    self.ctx.logger.info("[SetuPlugin] 已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
+                self._schedule_recall_for(stream_id, msg_id)
             except Exception as e:
                 info_lines.append("• " + r18_flag + title + " - " + author + " - 发送失败: " + str(e))
 
-            # both 模式下同时发送链接
+            # both 模式下同时发送链接（不计数，与既有行为一致）
             if send_mode == "both":
-                try:
-                    link_msg_id = await self._send_text_via_api(self._build_link_text(title, author, image_url), stream_id, group_id, user_id)
-                    recall_sec = self.config.limits.recall_after_seconds
-                    if recall_sec > 0 and link_msg_id:
-                        asyncio.create_task(self._schedule_recall(stream_id, recall_sec, link_msg_id))
-                except Exception:
-                    pass
+                await self._send_link_entry(item, image_url, stream_id, group_id, user_id, log_errors=False)
+
+        # ── 阶段五：链接条目逐条发送（link 模式全部 / kz_link 的 R18 部分 / 下载失败回退） ──
+        for item, image_url in link_entries:
+            if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
+                sent_count += 1
 
         return sent_count, info_lines
+
+    async def _download_all_bytes(self, urls: List[str]) -> List[Optional[bytes]]:
+        """并发预取一批图片的原始字节，保持输入顺序。
+
+        单张失败返回 None，不影响其他张；并发数由 api.max_concurrent_downloads 控制
+        （Semaphore 下限钳到 1，防止配置为 0 导致永久挂起）。
+        """
+        if not urls:
+            return []
+        semaphore = asyncio.Semaphore(max(1, int(self.config.api.max_concurrent_downloads)))
+
+        async def download_one(url: str) -> Optional[bytes]:
+            if not url:
+                return None
+            async with semaphore:
+                return await self._download_image_bytes(url)
+
+        return list(await asyncio.gather(*(download_one(u) for u in urls)))
+
+    def _to_base64(self, raw: Optional[bytes], url: str) -> Optional[str]:
+        """对原始字节做防风控处理并转 base64；失败返回 None。"""
+        if not raw:
+            return None
+        try:
+            return base64.b64encode(self._process_image(raw)).decode("utf-8")
+        except Exception as e:
+            self.ctx.logger.error("[SetuPlugin] 图片防风控处理失败: %s, url=%s", e, url, exc_info=True)
+            return None
+
+    def _build_caption(self, item: dict, index: int, total: int) -> str:
+        """构造转发节点的图片说明文本。"""
+        lines = ["【" + str(index) + "/" + str(total) + "】" + str(item.get("title", "未知"))]
+        lines.append("👤 " + str(item.get("author", "未知")))
+        lines.append("🆔 PID: " + str(item.get("pid", "")))
+        width, height = item.get("width"), item.get("height")
+        if width and height:
+            lines.append("📏 " + str(width) + "x" + str(height))
+        ai_label = AI_TYPE_LABELS.get(item.get("aiType"), "")
+        if ai_label:
+            lines.append(ai_label)
+        if item.get("r18"):
+            lines.append("🔞 R18")
+        tags = item.get("tags")
+        if isinstance(tags, list) and tags:
+            lines.append("🏷️ " + " ".join(str(t) for t in tags[:5]))
+        return "\n".join(lines)
+
+    async def _send_as_forward(self, image_entries, image_bytes_list, stream_id) -> bool:
+        """用合并转发（聊天记录）发送图片组，成功返回 True。
+
+        节点发送者使用宿主配置里的 bot 账号/昵称；消息段为 文本说明 + base64 图片。
+        下载失败（raw 为 None）的条目直接跳过，不生成节点。
+        """
+        nodes = []
+        total = len(image_entries)
+        for index, (entry, raw) in enumerate(zip(image_entries, image_bytes_list), start=1):
+            item, image_url = entry
+            b64 = self._to_base64(raw, image_url)
+            if not b64:
+                continue
+            nodes.append({
+                "user_id": self._bot_account,
+                "nickname": self._bot_nickname or "bot",
+                "segments": [
+                    {"type": "text", "content": self._build_caption(item, index, total)},
+                    {"type": "image", "content": b64},
+                ],
+            })
+        if not nodes:
+            self.ctx.logger.warning("[SetuPlugin] 没有可用的图片数据，跳过合并转发")
+            return False
+        try:
+            ok = await self.ctx.send.forward(nodes, stream_id)
+            if ok:
+                self.ctx.logger.info("[SetuPlugin] 合并转发已发送，共 %d 个节点", len(nodes))
+            return bool(ok)
+        except Exception as e:
+            self.ctx.logger.error("[SetuPlugin] 合并转发发送异常: %s", e)
+            return False
+
+    async def _send_link_entry(self, item, image_url, stream_id, group_id="", user_id="", log_errors=True) -> bool:
+        """发送单条图片链接（含伪装处理），按配置计划撤回。返回是否发送成功。"""
+        title = item.get("title", "未知")
+        author = item.get("author", "未知")
+        r18_flag = "🔞" if item.get("r18") else ""
+        link_text = self._build_link_text(title, author, image_url)
+        try:
+            msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+            self._schedule_recall_for(stream_id, msg_id)
+            return True
+        except Exception as e:
+            if log_errors:
+                self.ctx.logger.error("[SetuPlugin] 发送链接失败: %s（%s）", e, title)
+            return False
+
+    def _schedule_recall_for(self, stream_id: str, msg_id) -> None:
+        """按配置计划撤回一条消息；撤回关闭或无 message_id 时为空操作。"""
+        recall_sec = self.config.limits.recall_after_seconds
+        if recall_sec > 0 and msg_id:
+            self._spawn_task(self._schedule_recall(stream_id, recall_sec, msg_id))
+            self.ctx.logger.info("[SetuPlugin] 已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
 
     async def _send_image_via_api(self, b64_data, stream_id, group_id="", user_id=""):
         """通过 NapCat send_msg API 发送图片，返回 message_id"""
@@ -651,8 +1052,10 @@ class SetuPlugin(MaiBotPlugin):
             "注意：Lolicon 使用 Pixiv 标签精确匹配，不是自然语言语义搜索。"
             "调用前必须把用户描述的主题概念转换为 Pixiv 中实际存在的常见标签，"
             "优先使用日文标签，并补充常见英文、中文同义标签；不要直接照抄用户自然语言。"
+            "角色名、作品名这类模糊需求改用 keyword 参数；tags 与 keyword 二选一即可。"
         ),
         activation_type=ActivationType.ALWAYS,
+        timeout_ms=COMPONENT_TIMEOUT_MS,
         parameters=[
             ToolParameterInfo(
                 name="tags",
@@ -681,9 +1084,19 @@ class SetuPlugin(MaiBotPlugin):
                 items_schema={"type": "string"},
             ),
             ToolParameterInfo(
+                name="keyword",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "关键词模糊搜索，匹配标题、作者、标签。"
+                    "适合角色名、作品名这类不适合转成 Pixiv 标签的需求，例如「原神」。"
+                    "与 tags 二选一，都传时以 tags 为准"
+                ),
+                required=False,
+            ),
+            ToolParameterInfo(
                 name="num",
                 param_type=ToolParamType.INTEGER,
-                description="请求图片数量，1-3，默认1。每次最多请求3张，不要请求超过3张。",
+                description="请求图片数量，1 起步，上限以返回提示为准，默认 1。不要请求超过上限。",
                 required=False,
             ),
             ToolParameterInfo(
@@ -692,11 +1105,26 @@ class SetuPlugin(MaiBotPlugin):
                 description="是否请求 R18 内容。默认 false。若会话未开启 R18 权限会返回提示。",
                 required=False,
             ),
+            ToolParameterInfo(
+                name="aspect_ratio",
+                param_type=ToolParamType.STRING,
+                description="长宽比筛选。横图填 horizontal，竖图填 vertical，方图填 square；不填则不限",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="uid",
+                param_type=ToolParamType.INTEGER,
+                description="只看某个画师的作品时填其 Pixiv 用户 UID。一般不需要",
+                required=False,
+            ),
         ],
     )
-    async def handle_get_setu(self, tags=None, num=1, r18=None, stream_id="", **kwargs):
-        self.ctx.logger.info("[SetuPlugin] get_setu 被调用: stream_id=%s tags=%s r18=%s", stream_id, tags, r18)
-        rate_key = stream_id or "global"
+    async def handle_get_setu(self, tags=None, num=1, r18=None, keyword="", aspect_ratio="", uid=0, stream_id="", **kwargs):
+        self.ctx.logger.info(
+            "[SetuPlugin] get_setu 被调用: stream_id=%s tags=%s r18=%s keyword=%s aspect=%s uid=%s",
+            stream_id, tags, r18, keyword, aspect_ratio, uid,
+        )
+        rate_key = self._resolve_rate_key(stream_id, kwargs)
         if not self._rate_limiter.is_allowed(rate_key):
             remaining = self._rate_limiter.remaining(rate_key)
             return {"name": "get_setu", "content": "请求频率超限，剩余 " + str(remaining) + " 次/分钟"}
@@ -712,8 +1140,18 @@ class SetuPlugin(MaiBotPlugin):
             if not self._check_r18_permission(chat_id):
                 return {"name": "get_setu", "content": "当前会话 (" + chat_id + ") 未开启 R18 权限。你可以调用 enable_r18 工具开启。"}
 
-        num = max(1, min(num, 3))
-        result = await self._fetch_setu(tags=tags, num=num, r18=requested_r18)
+        # 长宽比：快捷词转表达式；非法值提示并忽略（不中断请求）
+        aspect_expr = self._normalize_aspect_ratio(aspect_ratio, notify_stream=stream_id)
+        max_num = self.config.api.max_num
+        num = max(1, min(int(num or 1), max_num))
+        result = await self._fetch_setu(
+            tags=tags,
+            num=num,
+            r18=requested_r18,
+            keyword=keyword,
+            uid=[uid] if uid and int(uid) > 0 else None,
+            aspect_ratio=aspect_expr,
+        )
 
         if not result["success"]:
             return {"name": "get_setu", "content": "获取图片失败: " + result["error"]}
@@ -732,7 +1170,7 @@ class SetuPlugin(MaiBotPlugin):
             detail_parts.append("《" + title + "》作者:" + author + " PID:" + str(pid) + " R18:" + is_r18 + " AI:" + ai_type + " 标签:[" + tags_str + "]")
 
         # 异步发送图片（不等待完成）
-        asyncio.create_task(self._send_setu_images(
+        self._spawn_task(self._send_setu_images(
             setu_list, stream_id,
             group_id=str(kwargs.get("group_id", "")),
             user_id=str(kwargs.get("user_id", "")),
@@ -741,6 +1179,34 @@ class SetuPlugin(MaiBotPlugin):
         summary = "图片正在发送给用户（共 " + str(len(setu_list)) + " 张）。"
         summary += "\n图片信息:\n" + "\n".join(detail_parts)
         return {"name": "get_setu", "content": summary}
+
+    def _normalize_aspect_ratio(self, aspect_ratio: str, notify_stream: str = "") -> str:
+        """把快捷词转成长宽比表达式；非法输入发提示并返回空串（忽略该条件）。
+
+        Args:
+            aspect_ratio: 用户输入（快捷词或表达式）。
+            notify_stream: 需要回显警告的会话；为空则只记日志。
+        """
+        text = str(aspect_ratio or "").strip()
+        if not text:
+            return ""
+        lowered = text.lower()
+        if lowered in ASPECT_RATIO_ALIASES:
+            return ASPECT_RATIO_ALIASES[lowered]
+        if validate_aspect_ratio(lowered):
+            return lowered
+        warning = "⚠️ 长宽比表达式无效: " + text + "，已忽略该条件。可用: 横图/竖图/方图 或 gt1.5 这类表达式"
+        self.ctx.logger.warning("[SetuPlugin] %s", warning)
+        if notify_stream:
+            self._spawn_task(self._safe_send_text(warning, notify_stream))
+        return ""
+
+    async def _safe_send_text(self, text: str, stream_id: str) -> None:
+        """发送纯文本提示，失败只记日志不抛出（用于非关键路径的用户提示）。"""
+        try:
+            await self.ctx.send.text(text, stream_id)
+        except Exception as e:
+            self.ctx.logger.warning("[SetuPlugin] 提示发送失败: %s", e)
 
     # ── 2. Tool: enable_r18 ────────────────────────────────
 
@@ -813,7 +1279,12 @@ class SetuPlugin(MaiBotPlugin):
 
     # ── 4. Command: /tu ──────────────────────────────────
 
-    @Command("tu", description="获取二次元图片，用法: /tu [标签...] [r18]", pattern=r"^/tu")
+    @Command(
+        "tu",
+        description="获取二次元图片，用法: /tu [数量] [#标签|kw:关键词] [横图|竖图|方图|gt1.5] [noai] [uid:画师] [r18]",
+        pattern=r"^/tu",
+        timeout_ms=COMPONENT_TIMEOUT_MS,
+    )
     async def handle_tu_command(self, stream_id="", **kwargs):
         self.ctx.logger.info("[SetuPlugin] /tu 命令被调用: stream_id=%s", stream_id)
         try:
@@ -838,25 +1309,25 @@ class SetuPlugin(MaiBotPlugin):
             else:
                 args_text = plain_text
 
-            args = args_text.split() if args_text else []
+            # 帮助
+            if args_text.strip().lower() in HELP_TRIGGERS:
+                await self.ctx.send.text(HELP_TEXT, stream_id)
+                return True, "显示帮助信息", True
 
-            tags = []
-            request_r18 = False
+            parsed = parse_tu_args(args_text, max_num=self.config.api.max_num)
 
-            for arg in args:
-                arg_lower = arg.lower()
-                if arg_lower in ("r18", "nsfw", "adult"):
-                    request_r18 = True
-                else:
-                    tags.append(arg)
+            if parsed.warnings:
+                self.ctx.logger.info("[SetuPlugin] /tu 参数提示: %s", "; ".join(parsed.warnings))
+                await self.ctx.send.text("ℹ️ " + "；".join(parsed.warnings), stream_id)
 
-            self.ctx.logger.info("[SetuPlugin] /tu 解析: tags=%s r18=%s", tags, request_r18)
-
-            # 命令模式固定返回 1 张
-            num = 1
+            self.ctx.logger.info(
+                "[SetuPlugin] /tu 解析: tags=%s keyword=%s aspect=%s uid=%s num=%s r18=%s noai=%s",
+                parsed.tags, parsed.keyword, parsed.aspect_ratio, parsed.uid,
+                parsed.num, parsed.request_r18, parsed.exclude_ai,
+            )
 
             r18_level = 0
-            if request_r18:
+            if parsed.request_r18:
                 chat_id = self._get_chat_id(
                     group_id=str(kwargs.get("group_id", "")),
                     user_id=str(kwargs.get("user_id", "")),
@@ -865,18 +1336,26 @@ class SetuPlugin(MaiBotPlugin):
                 if not self._check_r18_permission(chat_id):
                     await self.ctx.send.text(
                         "🔒 当前会话未开启 R18 权限，无法请求 R18 内容。\n"
-                        "如需开启，请向管理员申请，或向我表达意愿让我帮你开启。",
+                        "如需开启，请向管理员申请，或向我表达意愿让我帮我开启。",
                         stream_id,
                     )
                     return True, "R18 权限未开启", True
                 r18_level = 1
 
-            rate_key = stream_id or "global"
+            rate_key = self._resolve_rate_key(stream_id, kwargs)
             if not self._rate_limiter.is_allowed(rate_key):
                 await self.ctx.send.text("⏰ 请求过于频繁，请稍后再试~", stream_id)
                 return True, "频率限制", True
 
-            result = await self._fetch_setu(tags=tags, num=num, r18=r18_level)
+            result = await self._fetch_setu(
+                tags=parsed.tags or None,
+                num=parsed.num,
+                r18=r18_level,
+                keyword=parsed.keyword or None,
+                uid=[parsed.uid] if parsed.uid > 0 else None,
+                aspect_ratio=parsed.aspect_ratio or None,
+                exclude_ai=parsed.exclude_ai,
+            )
 
             if not result["success"]:
                 await self.ctx.send.text("❌ 获取图片失败: " + result["error"], stream_id)
@@ -891,7 +1370,7 @@ class SetuPlugin(MaiBotPlugin):
 
             return True, "已发送 " + str(sent_count) + " 张图片", True
         except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] /setu 命令异常: %s", e, exc_info=True)
+            self.ctx.logger.error("[SetuPlugin] /tu 命令异常: %s", e, exc_info=True)
             await self.ctx.send.text("❌ 插件内部错误: " + str(e), stream_id)
             return False, "插件内部错误: " + str(e), True
 
