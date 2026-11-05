@@ -279,7 +279,6 @@ class ApiConfig(PluginConfigBase):
     __ui_icon__ = "globe"
     __ui_order__ = 2
     base_url: str = Field(default="https://api.lolicon.app/setu/v2", description="Lolicon API 地址")
-    default_num: int = Field(default=1, description="默认请求图片数量")
     default_size: List[Literal["original", "regular", "small", "thumb", "mini"]] = Field(
         default_factory=lambda: ["regular"], description="默认图片规格（WebUI 下拉多选）"
     )
@@ -296,7 +295,7 @@ class ApiConfig(PluginConfigBase):
     )
     use_forward: bool = Field(
         default=False,
-        description="多图时用合并转发（聊天记录）发送，不刷屏。开启后该批图片走转发通道，自动撤回对转发消息不生效",
+        description="所有条目（图/链接）打包成一条合并转发（聊天记录）发送，不刷屏。撤回会对整条转发生效，取决于适配器支持",
     )
     max_concurrent_downloads: int = Field(
         default=3,
@@ -522,7 +521,7 @@ class SetuPlugin(MaiBotPlugin):
             )
         return self._http_session
 
-    def _get_chat_id(self, group_id: str = "", user_id: str = "", stream_id: str = "") -> str:
+    def _get_chat_id(self, group_id: str = "", user_id: str = "") -> str:
         if group_id and str(group_id).strip():
             gid = str(group_id).strip()
             if gid.isdigit():
@@ -724,97 +723,95 @@ class SetuPlugin(MaiBotPlugin):
     def _build_link_text(self, title: str, author: str, url: str) -> str:
         return title + " - " + author + "\n" + self._obfuscate_link(url)
 
-    async def _send_setu_images(self, setu_list, stream_id, group_id="", user_id=""):
-        """发送图片列表。两阶段结构：先分类并并发预取，再按发送模式发送。
+    async def _send_setu_images(self, setu_list, stream_id, group_id="", user_id="") -> int:
+        """发送图片列表，返回成功发出的条目数。
 
-        use_forward 开启时各模式的行为：
-        - image：全部图片进合并转发节点；
-        - both：图片进转发，链接照旧逐条发（转发成功后发）；
-        - kz_link：全年龄图片进转发，R18 链接照旧逐条发；
-        - link：纯链接，use_forward 无效。
-        转发消息无法通过 delete_msg 撤回，use_forward 生效时自动跳过撤回。
+        use_forward=false：逐条发送（图 + both 模式的链接），撤回逐条生效。
+        use_forward=true：所有条目（图/链接）统一打包进一条合并转发消息——
+        both 的链接文本并入图片节点，kz_link 的 R18 与 link 模式为纯文本节点；
+        发送成功即对整条转发调度一次撤回（图和链接一起撤），失败回退逐条。
         """
-        sent_count = 0
-        info_lines = []
         send_mode = self.config.api.send_mode.lower().strip()
-        use_forward = self.config.api.use_forward and send_mode != "link"
+        if not setu_list:
+            return 0
 
-        # ── 阶段一：按发送模式把条目分成图片组与链接组 ──
-        image_entries: List[Tuple[dict, str]] = []   # (条目, 图片地址)
-        link_entries: List[Tuple[dict, str]] = []    # (条目, 图片地址)
+        # ── 阶段一：收集条目（全部条目进统一列表；无图片地址的记日志跳过） ──
+        entries: List[Tuple[dict, str]] = []   # (条目, 图片地址；纯链接条目仅用地址生成链接文本)
         for item in setu_list:
             urls = item.get("urls", {})
             image_url = urls.get("regular") or urls.get("original") or urls.get("small") or urls.get("thumb")
-            title = item.get("title", "未知")
-            author = item.get("author", "未知")
-            r18_flag = "🔞" if item.get("r18") else ""
-
             if not image_url:
-                info_lines.append("• " + r18_flag + title + " - " + author + " - 获取图片地址失败")
+                self.ctx.logger.warning(
+                    "[SetuPlugin] • %s%s - %s - 获取图片地址失败",
+                    "🔞" if item.get("r18") else "", item.get("title", "未知"), item.get("author", "未知"),
+                )
                 continue
+            entries.append((item, image_url))
+        if not entries:
+            return 0
 
-            if send_mode == "link" or (send_mode == "kz_link" and item.get("r18")):
-                link_entries.append((item, image_url))
-            else:
-                image_entries.append((item, image_url))
+        flags = [self._entry_sends_image(item, send_mode) for item, _ in entries]
 
-        # ── 阶段二：并发预取图片原始字节（保序；单张失败为 None，不影响其他张） ──
-        image_bytes_list = await self._download_all_bytes([u for _, u in image_entries])
+        # ── 阶段二：并发预取"要发图"条目的原始字节（纯链接条目不下载；保序，单张失败为 None） ──
+        download_urls = [u for flag, (_, u) in zip(flags, entries) if flag]
+        downloaded = iter(await self._download_all_bytes(download_urls))
+        bytes_by_entry: List[Optional[bytes]] = [next(downloaded) if flag else None for flag in flags]
 
-        # ── 阶段三：合并转发（use_forward 开启且有图片条目时） ──
-        forward_used = False
-        if use_forward and image_entries:
-            forward_used = await self._send_as_forward(image_entries, image_bytes_list, stream_id)
-            if forward_used:
-                sent_count += len(image_entries)
-                if self.config.limits.recall_after_seconds > 0:
-                    self.ctx.logger.info("[SetuPlugin] 转发消息不支持撤回，本次跳过自动撤回")
-            else:
-                self.ctx.logger.warning("[SetuPlugin] 合并转发发送失败，回退逐条发送")
+        # ── 阶段三：合并转发（use_forward 开启时全部条目进一条转发消息） ──
+        if self.config.api.use_forward:
+            sent = await self._send_as_forward(entries, bytes_by_entry, send_mode, stream_id)
+            if sent is not None:
+                return sent
+            self.ctx.logger.warning("[SetuPlugin] 合并转发发送失败，回退逐条发送")
 
-        # ── 阶段四：图片组逐条发送（未走转发时） ──
-        for entry, raw in zip(image_entries, image_bytes_list):
-            item, image_url = entry
-
-            if forward_used:
-                # 图片已经通过转发发出；both 模式的链接仍需逐条发
-                if send_mode == "both":
-                    if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
-                        sent_count += 1
-                continue
-
+        # ── 阶段四：逐条发送（use_forward 关闭，或转发失败回退） ──
+        sent_count = 0
+        for index, ((item, image_url), raw) in enumerate(zip(entries, bytes_by_entry)):
+            r18_flag = "🔞" if item.get("r18") else ""
             title = item.get("title", "未知")
             author = item.get("author", "未知")
-            r18_flag = "🔞" if item.get("r18") else ""
+
+            if not flags[index]:
+                # 纯链接条目（link 模式全部 / kz_link 的 R18）
+                if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
+                    sent_count += 1
+                continue
 
             # 防风控处理（PIL 同步操作）放在发送侧逐张执行，不进并发协程，避免阻塞事件循环
             b64_data = self._to_base64(raw, image_url)
             if not b64_data:
-                # 图片下载或处理失败时回退到发链接（both 模式）或报错
+                # 图片下载或处理失败：both 模式回退发链接，其余记日志
                 if send_mode == "both":
                     if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
                         sent_count += 1
                 else:
-                    info_lines.append("• " + r18_flag + title + " - " + author + " - 图片下载失败")
+                    self.ctx.logger.warning("[SetuPlugin] • %s%s - %s - 图片下载失败", r18_flag, title, author)
                 continue
 
             try:
-                msg_id = await self._send_image_via_api(b64_data, stream_id, group_id, user_id)
+                msg_id = await self._send_segments_via_api(
+                    [{"type": "image", "data": {"file": "base64://" + b64_data}}],
+                    stream_id, group_id, user_id,
+                )
                 sent_count += 1
                 self._schedule_recall_for(stream_id, msg_id)
             except Exception as e:
-                info_lines.append("• " + r18_flag + title + " - " + author + " - 发送失败: " + str(e))
+                self.ctx.logger.warning("[SetuPlugin] • %s%s - %s - 发送失败: %s", r18_flag, title, author, e)
 
             # both 模式下同时发送链接（不计数，与既有行为一致）
             if send_mode == "both":
                 await self._send_link_entry(item, image_url, stream_id, group_id, user_id, log_errors=False)
 
-        # ── 阶段五：链接条目逐条发送（link 模式全部 / kz_link 的 R18 部分 / 下载失败回退） ──
-        for item, image_url in link_entries:
-            if await self._send_link_entry(item, image_url, stream_id, group_id, user_id):
-                sent_count += 1
+        return sent_count
 
-        return sent_count, info_lines
+    @staticmethod
+    def _entry_sends_image(item: dict, send_mode: str) -> bool:
+        """判断一个条目在当前发送模式下是否需要发图（否则只发链接）。"""
+        if send_mode == "link":
+            return False
+        if send_mode == "kz_link" and item.get("r18"):
+            return False
+        return True
 
     async def _download_all_bytes(self, urls: List[str]) -> List[Optional[bytes]]:
         """并发预取一批图片的原始字节，保持输入顺序。
@@ -862,47 +859,70 @@ class SetuPlugin(MaiBotPlugin):
             lines.append("🏷️ " + " ".join(str(t) for t in tags[:5]))
         return "\n".join(lines)
 
-    async def _send_as_forward(self, image_entries, image_bytes_list, stream_id) -> bool:
-        """用合并转发（聊天记录）发送图片组，成功返回 True。
+    async def _send_as_forward(self, entries, bytes_by_entry, send_mode, stream_id) -> Optional[int]:
+        """把全部条目（图/链接）打包成一条合并转发消息发送。
 
-        节点发送者使用宿主配置里的 bot 账号/昵称；消息段为 文本说明 + base64 图片。
-        下载失败（raw 为 None）的条目直接跳过，不生成节点。
+        返回成功发送的条目数；发送失败（sent=False 或异常）返回 None，由调用方回退逐条。
+        发送成功且拿到 message_id 时，按配置对整条转发调度一次撤回（图和链接一起撤）；
+        message_id 为空（部分适配器回执 async/空）时仅记日志：不撤回、也不回退，防止双发。
+
+        节点发送者使用宿主配置里的 bot 账号/昵称（读不到时适配器会回填连接账号）。
         """
         nodes = []
-        total = len(image_entries)
-        for index, (entry, raw) in enumerate(zip(image_entries, image_bytes_list), start=1):
-            item, image_url = entry
-            b64 = self._to_base64(raw, image_url)
-            if not b64:
-                continue
+        total = len(entries)
+        for index, ((item, image_url), raw) in enumerate(zip(entries, bytes_by_entry), start=1):
+            if self._entry_sends_image(item, send_mode):
+                text = self._build_caption(item, index, total)
+                # both 模式的链接并入同一节点；下载失败时也附链接作文本版回退
+                if send_mode == "both" or not raw:
+                    text += "\n🔗 " + self._obfuscate_link(image_url)
+                if not raw:
+                    self.ctx.logger.info("[SetuPlugin] 第 %d 张下载失败，转发节点降级为文本链接", index)
+                segments: List[dict] = [{"type": "text", "content": text}]
+                b64 = self._to_base64(raw, image_url)
+                if b64:
+                    segments.append({"type": "image", "content": b64})
+            else:
+                # 纯链接节点（link 模式全部 / kz_link 的 R18）：说明 + 伪装链接，与图文节点格式一致
+                segments = [{
+                    "type": "text",
+                    "content": self._build_caption(item, index, total) + "\n🔗 " + self._obfuscate_link(image_url),
+                }]
             nodes.append({
                 "user_id": self._bot_account,
                 "nickname": self._bot_nickname or "bot",
-                "segments": [
-                    {"type": "text", "content": self._build_caption(item, index, total)},
-                    {"type": "image", "content": b64},
-                ],
+                "segments": segments,
             })
         if not nodes:
-            self.ctx.logger.warning("[SetuPlugin] 没有可用的图片数据，跳过合并转发")
-            return False
+            self.ctx.logger.warning("[SetuPlugin] 没有可用的转发节点，跳过合并转发")
+            return None
         try:
-            ok = await self.ctx.send.forward(nodes, stream_id)
-            if ok:
-                self.ctx.logger.info("[SetuPlugin] 合并转发已发送，共 %d 个节点", len(nodes))
-            return bool(ok)
+            result = await self.ctx.send.forward(nodes, stream_id, return_details=True)
         except Exception as e:
             self.ctx.logger.error("[SetuPlugin] 合并转发发送异常: %s", e)
-            return False
+            return None
+        sent = bool(result.get("sent")) if isinstance(result, dict) else bool(result)
+        if not sent:
+            self.ctx.logger.warning("[SetuPlugin] 合并转发未成功发送")
+            return None
+        msg_id = result.get("message_id") if isinstance(result, dict) else None
+        if msg_id:
+            self._schedule_recall_for(stream_id, msg_id)
+        else:
+            self.ctx.logger.warning("[SetuPlugin] 转发已发送但未取到 message_id，本次无法自动撤回")
+        self.ctx.logger.info("[SetuPlugin] 合并转发已发送，共 %d 个节点", len(nodes))
+        return len(nodes)
 
     async def _send_link_entry(self, item, image_url, stream_id, group_id="", user_id="", log_errors=True) -> bool:
         """发送单条图片链接（含伪装处理），按配置计划撤回。返回是否发送成功。"""
         title = item.get("title", "未知")
         author = item.get("author", "未知")
-        r18_flag = "🔞" if item.get("r18") else ""
         link_text = self._build_link_text(title, author, image_url)
         try:
-            msg_id = await self._send_text_via_api(link_text, stream_id, group_id, user_id)
+            msg_id = await self._send_segments_via_api(
+                [{"type": "text", "data": {"text": link_text}}],
+                stream_id, group_id, user_id,
+            )
             self._schedule_recall_for(stream_id, msg_id)
             return True
         except Exception as e:
@@ -917,31 +937,28 @@ class SetuPlugin(MaiBotPlugin):
             self._spawn_task(self._schedule_recall(stream_id, recall_sec, msg_id))
             self.ctx.logger.info("[SetuPlugin] 已计划撤回 message_id=%s 延迟%ds", msg_id, recall_sec)
 
-    async def _send_image_via_api(self, b64_data, stream_id, group_id="", user_id=""):
-        """通过 NapCat send_msg API 发送图片，返回 message_id"""
-        # 构造图片消息段
-        image_segment = {
-            "type": "image",
-            "data": {
-                "file": "base64://" + b64_data
-            }
-        }
+    async def _send_segments_via_api(self, segments: List[dict], stream_id, group_id="", user_id=""):
+        """通过适配器 send_msg API 发送消息段，返回 message_id。
+
+        未指定群号/用户号，或适配器调用失败时，按第一个消息段的类型回退到
+        ctx.send.image / ctx.send.text 并返回 None（调用方据此跳过撤回）。
+        """
         # 确定发送目标
         if group_id:
             send_params = {
                 "message_type": "group",
                 "group_id": int(group_id) if str(group_id).isdigit() else group_id,
-                "message": [image_segment],
+                "message": segments,
             }
         elif user_id:
             send_params = {
                 "message_type": "private",
                 "user_id": int(user_id) if str(user_id).isdigit() else user_id,
-                "message": [image_segment],
+                "message": segments,
             }
         else:
-            # 回退：使用 ctx.send.image
-            await self.ctx.send.image(b64_data, stream_id)
+            # 回退：使用 ctx.send
+            await self._fallback_send(segments, stream_id)
             return None
 
         try:
@@ -952,73 +969,28 @@ class SetuPlugin(MaiBotPlugin):
             )
             self.ctx.logger.info("[SetuPlugin] send_msg API 返回: %s", result)
             if isinstance(result, dict) and not result.get("success", True):
-                self.ctx.logger.warning("[SetuPlugin] send_msg API 失败，回退到 ctx.send.image")
-                await self.ctx.send.image(b64_data, stream_id)
+                self.ctx.logger.warning("[SetuPlugin] send_msg API 失败，回退到 ctx.send")
+                await self._fallback_send(segments, stream_id)
                 return None
             if isinstance(result, dict):
                 msg_id = result.get("message_id")
                 if not msg_id and isinstance(result.get("data"), dict):
                     msg_id = result["data"].get("message_id")
-                if not msg_id:
-                    msg_id = result.get("external_message_id")
                 self.ctx.logger.info("[SetuPlugin] 提取到 message_id=%s", msg_id)
                 return msg_id
             return None
         except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] send_msg API 调用失败: %s，回退到 ctx.send.image", e)
-            await self.ctx.send.image(b64_data, stream_id)
+            self.ctx.logger.error("[SetuPlugin] send_msg API 调用失败: %s，回退到 ctx.send", e)
+            await self._fallback_send(segments, stream_id)
             return None
 
-    async def _send_text_via_api(self, text, stream_id, group_id="", user_id=""):
-        """通过 NapCat send_msg API 发送文本消息，返回 message_id"""
-        text_segment = {
-            "type": "text",
-            "data": {
-                "text": text
-            }
-        }
-        # 确定发送目标
-        if group_id:
-            send_params = {
-                "message_type": "group",
-                "group_id": int(group_id) if str(group_id).isdigit() else group_id,
-                "message": [text_segment],
-            }
-        elif user_id:
-            send_params = {
-                "message_type": "private",
-                "user_id": int(user_id) if str(user_id).isdigit() else user_id,
-                "message": [text_segment],
-            }
+    async def _fallback_send(self, segments: List[dict], stream_id: str) -> None:
+        """适配器不可用时的回退发送：按第一个消息段的类型分发。"""
+        first = segments[0] if segments else {"type": "text", "data": {"text": ""}}
+        if first.get("type") == "image":
+            await self.ctx.send.image(str(first.get("data", {}).get("file", ""))[len("base64://"):], stream_id)
         else:
-            # 回退：使用 ctx.send.text
-            await self.ctx.send.text(text, stream_id)
-            return None
-
-        try:
-            result = await self.ctx.api.call(
-                "adapter.napcat.message.send_msg",
-                version="1",
-                params=send_params,
-            )
-            self.ctx.logger.info("[SetuPlugin] send_text API 返回: %s", result)
-            if isinstance(result, dict) and not result.get("success", True):
-                self.ctx.logger.warning("[SetuPlugin] send_text API 失败，回退到 ctx.send.text")
-                await self.ctx.send.text(text, stream_id)
-                return None
-            if isinstance(result, dict):
-                msg_id = result.get("message_id")
-                if not msg_id and isinstance(result.get("data"), dict):
-                    msg_id = result["data"].get("message_id")
-                if not msg_id:
-                    msg_id = result.get("external_message_id")
-                self.ctx.logger.info("[SetuPlugin] 文本提取到 message_id=%s", msg_id)
-                return msg_id
-            return None
-        except Exception as e:
-            self.ctx.logger.error("[SetuPlugin] send_text API 调用失败: %s，回退到 ctx.send.text", e)
-            await self.ctx.send.text(text, stream_id)
-            return None
+            await self.ctx.send.text(str(first.get("data", {}).get("text", "")), stream_id)
 
     async def _schedule_recall(self, stream_id, seconds, message_id=None):
         try:
@@ -1135,7 +1107,6 @@ class SetuPlugin(MaiBotPlugin):
             chat_id = self._get_chat_id(
                 group_id=str(kwargs.get("group_id", "")),
                 user_id=str(kwargs.get("user_id", "")),
-                stream_id=stream_id,
             )
             if not self._check_r18_permission(chat_id):
                 return {"name": "get_setu", "content": "当前会话 (" + chat_id + ") 未开启 R18 权限。你可以调用 enable_r18 工具开启。"}
@@ -1230,7 +1201,7 @@ class SetuPlugin(MaiBotPlugin):
         ],
     )
     async def handle_enable_r18(self, reason="", stream_id="", group_id="", user_id="", **kwargs):
-        chat_id = self._get_chat_id(group_id=group_id, user_id=user_id, stream_id=stream_id)
+        chat_id = self._get_chat_id(group_id=group_id, user_id=user_id)
         if self._check_r18_permission(chat_id):
             return {"name": "enable_r18", "content": "当前会话已拥有 R18 权限，无需重复操作。"}
         if not chat_id:
@@ -1265,7 +1236,7 @@ class SetuPlugin(MaiBotPlugin):
         ],
     )
     async def handle_disable_r18(self, reason="", stream_id="", group_id="", user_id="", **kwargs):
-        chat_id = self._get_chat_id(group_id=group_id, user_id=user_id, stream_id=stream_id)
+        chat_id = self._get_chat_id(group_id=group_id, user_id=user_id)
         if not chat_id:
             return {"name": "disable_r18", "content": "无法识别当前会话的群号或用户号，无法操作。"}
         if not self._check_r18_permission(chat_id):
@@ -1331,7 +1302,6 @@ class SetuPlugin(MaiBotPlugin):
                 chat_id = self._get_chat_id(
                     group_id=str(kwargs.get("group_id", "")),
                     user_id=str(kwargs.get("user_id", "")),
-                    stream_id=stream_id,
                 )
                 if not self._check_r18_permission(chat_id):
                     await self.ctx.send.text(
@@ -1362,7 +1332,7 @@ class SetuPlugin(MaiBotPlugin):
                 return False, result["error"], True
 
             setu_list = result["data"]
-            sent_count, _ = await self._send_setu_images(
+            sent_count = await self._send_setu_images(
                 setu_list, stream_id,
                 group_id=str(kwargs.get("group_id", "")),
                 user_id=str(kwargs.get("user_id", "")),

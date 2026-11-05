@@ -11,6 +11,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -171,11 +172,42 @@ class FakePaths:
     data_dir = Path(__file__).parent / "_tmp_data"
 
 
+class FakeApi:
+    def __init__(self):
+        self.calls = []
+
+    async def call(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return {"success": True, "message_id": 555}
+
+
+class FakeSend:
+    def __init__(self):
+        self.forwards = []
+        self.texts = []
+        self.images = []
+        self.forward_result = {"sent": True, "message_id": "777"}
+        self.forward_exc = None
+
+    async def forward(self, nodes, stream_id, return_details=False, **kwargs):
+        self.forwards.append({"nodes": nodes, "stream_id": stream_id, "return_details": return_details})
+        if self.forward_exc:
+            raise self.forward_exc
+        return self.forward_result
+
+    async def text(self, text, stream_id, **kwargs):
+        self.texts.append((text, stream_id))
+
+    async def image(self, b64, stream_id, **kwargs):
+        self.images.append((b64, stream_id))
+
+
 class FakeCtx:
     def __init__(self):
         self.paths = FakePaths()
         self.logger = FakeLogger()
-        self.forward_calls = []
+        self.api = FakeApi()
+        self.send = FakeSend()
 
     async def config_get(self, key, default=None):
         return default
@@ -260,10 +292,10 @@ class TestRateKey:
 
 
 class TestForward:
-    def _make(self, use_forward=True):
+    def _make(self, use_forward=True, send_mode="image"):
         p = make_plugin()
         p.config.api.use_forward = use_forward
-        p.config.api.send_mode = "image"
+        p.config.api.send_mode = send_mode
         p._bot_account = "10001"
         p._bot_nickname = "测试Bot"
         return p
@@ -274,52 +306,48 @@ class TestForward:
         assert "send.forward" in manifest["capabilities"]
 
     def test_nodes_built_and_aligned(self):
-        """下载失败的条目不生成节点；节点结构含 user_id/nickname/segments。"""
+        """下载失败的条目降级为纯文本节点（含伪装链接）；节点结构含 user_id/nickname/segments。"""
         p = self._make()
+        p.config.limits.recall_after_seconds = 0  # 本用例不关心撤回，避免挂起任务
         entries = [
-            ({"title": "a", "author": "x", "pid": 1, "width": 800, "height": 1200}, "https://u/1.jpg"),
-            ({"title": "b", "author": "y", "pid": 2}, "https://u/2.jpg"),
+            ({"title": "a", "author": "x", "pid": 1, "width": 800, "height": 1200}, "https://i.pximg.net/a.jpg"),
+            ({"title": "b", "author": "y", "pid": 2}, "https://i.pximg.net/b.jpg"),
         ]
         bytes_list = [b"\x89PNG" + b"0" * 200, None]  # 第二张下载失败
 
-        async def fake_send_forward(nodes, stream_id):
-            p._ctx.forward_calls.append(nodes)
-            return True
-
-        p._ctx.send = type("S", (), {"forward": staticmethod(fake_send_forward)})()
-        # _process_image 对假字节会失败 → 需要真图；改用 monkeypatch 跳过处理
+        # _process_image 对假字节会失败 → monkeypatch 跳过处理
         p._to_base64 = lambda raw, url: ("YjY0ZGF0YQ==" if raw else None)
-        ok = asyncio.run(p._send_as_forward(entries, bytes_list, "stream_1"))
-        assert ok is True
-        nodes = p._ctx.forward_calls[0]
-        assert len(nodes) == 1  # 失败条目被跳过，长度天然对齐
-        node = nodes[0]
-        assert node["user_id"] == "10001" and node["nickname"] == "测试Bot"
-        types = [seg["type"] for seg in node["segments"]]
-        assert types == ["text", "image"]
-        assert "【1/2】a" in node["segments"][0]["content"]
+        sent = asyncio.run(p._send_as_forward(entries, bytes_list, "image", "stream_1"))
+        assert sent == 2  # 两个条目都有节点（失败条目降级为文本节点）
+        record = p._ctx.send.forwards[0]
+        assert record["return_details"] is True
+        nodes = record["nodes"]
+        assert len(nodes) == 2
+        node1, node2 = nodes
+        assert node1["user_id"] == "10001" and node1["nickname"] == "测试Bot"
+        assert [seg["type"] for seg in node1["segments"]] == ["text", "image"]
+        assert "【1/2】a" in node1["segments"][0]["content"]
+        # 下载失败条目：纯文本节点 + 伪装链接
+        assert [seg["type"] for seg in node2["segments"]] == ["text"]
+        assert "【2/2】b" in node2["segments"][0]["content"]
+        assert "i点pximg点net/b.jpg" in node2["segments"][0]["content"]
 
     def test_forward_disabled_noop(self):
-        """use_forward=false 时 _send_setu_images 不调用 forward。"""
+        """use_forward=false 时不调用 forward，走逐条路径。"""
         p = self._make(use_forward=False)
-        called = []
+        p.config.limits.recall_after_seconds = 0
 
         async def fake_download(urls):
             return [None for _ in urls]
 
         p._download_all_bytes = fake_download
-
-        async def fake_forward(nodes, stream_id):
-            called.append(nodes)
-            return True
-
-        p._ctx.send = type("S", (), {"forward": staticmethod(fake_forward)})()
         items = [{"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://u/1.jpg"}}]
-        asyncio.run(p._send_setu_images(items, "stream_1"))
-        assert called == []  # 未走转发
+        sent = asyncio.run(p._send_setu_images(items, "stream_1"))
+        assert p._ctx.send.forwards == []  # 未走转发
+        assert sent == 0  # 下载失败未发出
 
-    def test_forward_mode_skips_recall(self):
-        """use_forward 生效时不调度撤回（转发消息无 message_id）。"""
+    def test_forward_recalls_whole_forward(self):
+        """转发成功且拿到 message_id → 对整条转发调度一次撤回。"""
         p = self._make(use_forward=True)
         p.config.limits.recall_after_seconds = 90
         scheduled = []
@@ -330,15 +358,126 @@ class TestForward:
 
         p._download_all_bytes = fake_download
         p._to_base64 = lambda raw, url: "YjY0"
-
-        async def fake_forward(nodes, stream_id):
-            return True
-
-        p._ctx.send = type("S", (), {"forward": staticmethod(fake_forward)})()
         items = [{"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://u/1.jpg"}}]
-        sent, _ = asyncio.run(p._send_setu_images(items, "stream_1"))
+        sent = asyncio.run(p._send_setu_images(items, "stream_1"))
         assert sent == 1
-        assert scheduled == []  # 转发成功路径不安排任何撤回任务
+        assert len(scheduled) == 1
+        assert scheduled[0].cr_code.co_name == "_schedule_recall"
+
+        # 实际执行撤回协程：delete_msg 收到的正是转发容器的 message_id
+        coro = scheduled[0]
+
+        async def fake_sleep(seconds):
+            pass
+
+        with patch("asyncio.sleep", new=fake_sleep):
+            asyncio.run(coro)
+        (api_args, api_kwargs) = p._ctx.api.calls[0]
+        assert api_args[0] == "adapter.napcat.message.delete_msg"
+        assert api_kwargs["message_id"] == 777
+
+    def test_forward_no_message_id_no_fallback(self):
+        """sent=True 但 message_id 为空：不撤回、也不回退逐条（防双发）。"""
+        p = self._make(use_forward=True)
+        p.config.limits.recall_after_seconds = 90
+        scheduled = []
+        p._spawn_task = lambda coro: scheduled.append(coro)
+
+        async def fake_download(urls):
+            return [b"x" * 200 for _ in urls]
+
+        p._download_all_bytes = fake_download
+        p._to_base64 = lambda raw, url: "YjY0"
+        p._ctx.send.forward_result = {"sent": True, "message_id": None}
+        items = [{"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://u/1.jpg"}}]
+        sent = asyncio.run(p._send_setu_images(items, "stream_1"))
+        assert sent == 1
+        assert scheduled == []  # 未调度撤回
+        assert p._ctx.api.calls == []  # 未回退逐条
+
+    def test_forward_fails_fallback_per_item(self):
+        """转发异常 → 回退逐条：图经适配器发送且逐条撤回生效。"""
+        p = self._make(use_forward=True)
+        p.config.limits.recall_after_seconds = 90
+        scheduled = []
+        p._spawn_task = lambda coro: scheduled.append(coro)
+
+        async def fake_download(urls):
+            return [b"x" * 200 for _ in urls]
+
+        p._download_all_bytes = fake_download
+        p._to_base64 = lambda raw, url: "YjY0"
+        p._ctx.send.forward_exc = RuntimeError("boom")
+        items = [{"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://u/1.jpg"}}]
+        sent = asyncio.run(p._send_setu_images(items, "stream_1", group_id="12345"))
+        assert sent == 1
+        assert len(p._ctx.send.forwards) == 1  # 尝试过一次转发
+        (api_args, api_kwargs) = p._ctx.api.calls[0]
+        assert api_args[0] == "adapter.napcat.message.send_msg"
+        assert len(scheduled) == 1  # 逐条撤回生效
+        assert scheduled[0].cr_code.co_name == "_schedule_recall"
+        scheduled[0].close()  # 不实际执行，显式关闭避免 GC 警告
+
+    def test_both_link_inside_forward(self):
+        """both+use_forward：链接文本并入图片节点，不再逐条发链接。"""
+        p = self._make(use_forward=True, send_mode="both")
+        p.config.limits.recall_after_seconds = 0
+
+        async def fake_download(urls):
+            return [b"x" * 200 for _ in urls]
+
+        p._download_all_bytes = fake_download
+        p._to_base64 = lambda raw, url: "YjY0"
+        items = [{"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://i.pximg.net/a.jpg"}}]
+        sent = asyncio.run(p._send_setu_images(items, "stream_1"))
+        assert sent == 1
+        assert len(p._ctx.send.forwards) == 1
+        node = p._ctx.send.forwards[0]["nodes"][0]
+        assert [seg["type"] for seg in node["segments"]] == ["text", "image"]
+        assert "🔗 i点pximg点net/a.jpg" in node["segments"][0]["content"]
+        assert p._ctx.api.calls == []  # 链接没有额外逐条发送
+
+    def test_kz_link_r18_text_node(self):
+        """kz_link+use_forward：R18 条目为纯文本节点（伪装链接），不下载图片。"""
+        p = self._make(use_forward=True, send_mode="kz_link")
+        p.config.limits.recall_after_seconds = 0
+        downloaded = []
+
+        async def fake_download(urls):
+            downloaded.extend(urls)
+            return [b"x" * 200 for _ in urls]
+
+        p._download_all_bytes = fake_download
+        items = [{"title": "a", "author": "x", "pid": 1, "r18": True, "urls": {"regular": "https://i.pximg.net/a.jpg"}}]
+        sent = asyncio.run(p._send_setu_images(items, "stream_1"))
+        assert sent == 1
+        assert downloaded == []  # R18 走链接，不下载
+        node = p._ctx.send.forwards[0]["nodes"][0]
+        assert [seg["type"] for seg in node["segments"]] == ["text"]
+        assert "🔗 i点pximg点net/a.jpg" in node["segments"][0]["content"]
+
+    def test_link_mode_forward_text_nodes(self):
+        """link 模式 + use_forward：全部为纯文本节点。"""
+        p = self._make(use_forward=True, send_mode="link")
+        p.config.limits.recall_after_seconds = 0
+        items = [
+            {"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://i.pximg.net/a.jpg"}},
+            {"title": "b", "author": "y", "pid": 2, "urls": {"regular": "https://i.pximg.net/b.jpg"}},
+        ]
+        sent = asyncio.run(p._send_setu_images(items, "stream_1"))
+        assert sent == 2
+        nodes = p._ctx.send.forwards[0]["nodes"]
+        assert len(nodes) == 2
+        for i, node in enumerate(nodes, start=1):
+            assert [seg["type"] for seg in node["segments"]] == ["text"]
+            assert f"【{i}/2】" in node["segments"][0]["content"]
+
+    def test_empty_entries_guard(self):
+        """条目全无地址 / 空列表：返回 0，不调用转发。"""
+        p = self._make(use_forward=True)
+        assert asyncio.run(p._send_setu_images([], "s")) == 0
+        assert asyncio.run(p._send_setu_images([{"title": "a", "urls": {}}], "s")) == 0
+        assert p._ctx.send.forwards == []
 
 
 # ── 并发下载 ────────────────────────────────────────────────
