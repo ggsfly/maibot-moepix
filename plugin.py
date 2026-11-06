@@ -762,9 +762,15 @@ class SetuPlugin(MaiBotPlugin):
             sent = await self._send_as_forward(entries, bytes_by_entry, send_mode, stream_id)
             if sent is not None:
                 return sent
-            self.ctx.logger.warning("[SetuPlugin] 合并转发发送失败，回退逐条发送")
+            # 转发结果不可信时不回退逐条：部分适配器会对已送达的转发返回失败回执
+            # （如 status=async），此时回退会导致同一条内容发两次。
+            self.ctx.logger.warning(
+                "[SetuPlugin] 合并转发返回失败（消息可能已实际发出），为避免重复发送不再回退逐条；"
+                "详情请查看宿主/适配器日志，或关闭 use_forward 使用逐条发送"
+            )
+            return 0
 
-        # ── 阶段四：逐条发送（use_forward 关闭，或转发失败回退） ──
+        # ── 阶段四：逐条发送（use_forward 关闭时） ──
         sent_count = 0
         for index, ((item, image_url), raw) in enumerate(zip(entries, bytes_by_entry)):
             r18_flag = "🔞" if item.get("r18") else ""
@@ -862,9 +868,11 @@ class SetuPlugin(MaiBotPlugin):
     async def _send_as_forward(self, entries, bytes_by_entry, send_mode, stream_id) -> Optional[int]:
         """把全部条目（图/链接）打包成一条合并转发消息发送。
 
-        返回成功发送的条目数；发送失败（sent=False 或异常）返回 None，由调用方回退逐条。
+        返回成功发送的条目数；发送失败（sent=False 或异常）返回 None。
+        调用方在 None 时不回退逐条——部分适配器会对已送达的转发返回失败回执
+        （如 status=async），回退会造成重复发送。
         发送成功且拿到 message_id 时，按配置对整条转发调度一次撤回（图和链接一起撤）；
-        message_id 为空（部分适配器回执 async/空）时仅记日志：不撤回、也不回退，防止双发。
+        message_id 为空（部分适配器回执 async/空）时仅记日志：不撤回。
 
         节点发送者使用宿主配置里的 bot 账号/昵称（读不到时适配器会回填连接账号）。
         """

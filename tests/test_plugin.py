@@ -395,8 +395,8 @@ class TestForward:
         assert scheduled == []  # 未调度撤回
         assert p._ctx.api.calls == []  # 未回退逐条
 
-    def test_forward_fails_fallback_per_item(self):
-        """转发异常 → 回退逐条：图经适配器发送且逐条撤回生效。"""
+    def test_forward_failure_no_duplicate_fallback(self):
+        """转发异常时不回退逐条（部分适配器对已送达的转发返回失败回执，回退会重复发送）。"""
         p = self._make(use_forward=True)
         p.config.limits.recall_after_seconds = 90
         scheduled = []
@@ -410,13 +410,10 @@ class TestForward:
         p._ctx.send.forward_exc = RuntimeError("boom")
         items = [{"title": "a", "author": "x", "pid": 1, "urls": {"regular": "https://u/1.jpg"}}]
         sent = asyncio.run(p._send_setu_images(items, "stream_1", group_id="12345"))
-        assert sent == 1
+        assert sent == 0
         assert len(p._ctx.send.forwards) == 1  # 尝试过一次转发
-        (api_args, api_kwargs) = p._ctx.api.calls[0]
-        assert api_args[0] == "adapter.napcat.message.send_msg"
-        assert len(scheduled) == 1  # 逐条撤回生效
-        assert scheduled[0].cr_code.co_name == "_schedule_recall"
-        scheduled[0].close()  # 不实际执行，显式关闭避免 GC 警告
+        assert p._ctx.api.calls == []  # 未回退逐条发送任何内容
+        assert scheduled == []  # 也没有任何撤回任务
 
     def test_both_link_inside_forward(self):
         """both+use_forward：链接文本并入图片节点，不再逐条发链接。"""
